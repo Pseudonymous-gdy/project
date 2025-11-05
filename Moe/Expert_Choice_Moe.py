@@ -31,9 +31,9 @@ class Expert_Choice(nn.Module):
       - train_one_epoch / evaluate mirror your existing signatures.
 
     Notes:
-      - For selection stability we use RAW gate scores (noisy selection可选开关)。
+      - For selection stability we use RAW gate scores (noisy selection optional).
       - Capacity factor drives the per-expert bucket size. If None, we default to 1.0.
-      - All ops are AMP friendly; if你要 AMP，只需在训练/评测侧用 autocast 包裹即可。
+      - All ops are AMP friendly; if you want AMP, just wrap training/evaluation with autocast.
     """
 
     def __init__(
