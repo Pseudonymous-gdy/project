@@ -12,6 +12,11 @@ import os
 import sys
 import argparse
 
+configurations = [
+    {'structure': 'resnet18', 'num_experts': 16, 'top_k': 4}
+]
+
+
 
 def test():
     pass
