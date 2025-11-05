@@ -241,19 +241,18 @@ if __name__ == "__main__":
         num_experts=6,
         backbone_structure="resnet18",
         backbone_pretrained=False,
-        num_features=64,      # a bit larger feature for clearer routing
-        hidden_size=128,
+        num_features=32,      # a bit larger feature for clearer routing
         output_size=100,      # CIFAR-100 first
         capacity_factor=1.0,  # typical EC bucket
         use_noisy_scores=False,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.02)
-    EPOCHS = 30
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=1e-4)
+    EPOCHS = 50
 
     # CIFAR-100 quick run
     train_loader, test_loader, _ = cifar100.get_dataloaders(
-        batch_size=128, num_workers=4
+        batch_size=64, num_workers=0
     )
     for epoch in range(EPOCHS):
         avg_loss, acc = model.train_one_epoch(train_loader, optimizer, device, max_batches=20)
@@ -274,7 +273,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.02)
 
     train_loader, test_loader, _ = cifar10.get_dataloaders(
-        batch_size=128, num_workers=4
+        batch_size=64, num_workers=0
     )
     for epoch in range(EPOCHS):
         avg_loss, acc = model.train_one_epoch(train_loader, optimizer, device, max_batches=20)
