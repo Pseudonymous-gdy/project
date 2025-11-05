@@ -32,8 +32,8 @@ class Simple_Moe(nn.Module):
 
     def __init__(
         self,
-        num_experts: int = 4,
-        top_k: int = 1,
+        num_experts: int = 16,
+        top_k: int = 2,
         aux_loss_weight: float = 0.0,      # kept for backward compat; prefer w_importance/w_load
         **kwargs,
     ):
@@ -75,12 +75,12 @@ class Simple_Moe(nn.Module):
             self.noise_scale = nn.Parameter(torch.zeros(self.num_experts))
 
         # Optional router softmax temperature over Top-k scores (stabilization knob)
-        self.router_temperature = float(kwargs.get('router_temperature', 1.0))
+        self.router_temperature = float(kwargs.get('router_temperature', 1.5))
 
         # ------------- Balancing loss weights ------------------------
         # Prefer explicit weights; if aux_loss_weight provided, split evenly.
         self.w_importance = float(kwargs.get('w_importance', 0.01))
-        self.w_load = float(kwargs.get('w_load', 0.01))
+        self.w_load = float(kwargs.get('w_load', 0.005))
         if aux_loss_weight > 0.0:
             self.w_importance = self.w_importance or aux_loss_weight
             self.w_load = self.w_load or aux_loss_weight
