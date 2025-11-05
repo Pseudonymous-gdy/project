@@ -79,8 +79,8 @@ class Simple_Moe(nn.Module):
 
         # ------------- Balancing loss weights ------------------------
         # Prefer explicit weights; if aux_loss_weight provided, split evenly.
-        self.w_importance = float(kwargs.get('w_importance', 0.01))
-        self.w_load = float(kwargs.get('w_load', 0.005))
+        self.w_importance = float(kwargs.get('w_importance', 0.001))
+        self.w_load = float(kwargs.get('w_load', 0.0005))
         if aux_loss_weight > 0.0:
             self.w_importance = self.w_importance or aux_loss_weight
             self.w_load = self.w_load or aux_loss_weight
@@ -209,17 +209,17 @@ class Simple_Moe(nn.Module):
         for e in range(self.num_experts):
             # mask tokens where expert e appears in any of the k positions
             mask = (topk_indices == e).any(dim=1)  # [B] bool
-            if not mask.any():
+            if not mask.any(): # if no tokens routed to this expert, skip it
                 continue
 
-            token_idx = torch.nonzero(mask, as_tuple=False).view(-1)  # [Be]
-            Be = token_idx.numel()
+            token_idx = torch.nonzero(mask, as_tuple=False).view(-1)  # [Be], get indices of tokens for expert e
+            Be = token_idx.numel() # number of tokens for expert e
 
             # Capacity handling: keep first `capacity` tokens, drop the rest
-            if capacity is not None and Be > capacity:
+            if capacity is not None and Be > capacity: # if Be > capacity, drop the rest
                 overflow = Be - capacity
-                overflow_dropped[e] += overflow
-                token_idx = token_idx[:capacity]
+                overflow_dropped[e] += overflow # count dropped tokens for expert e
+                token_idx = token_idx[:capacity] # cut to capacity
                 Be = capacity
 
             # Features for tokens routed to expert e
@@ -285,7 +285,7 @@ class Simple_Moe(nn.Module):
             optimizer.zero_grad(set_to_none=True)
 
             # Single forward pass with aux routing stats
-            outputs, aux = self.forward(inputs, return_aux=True)
+            outputs, aux = self.forward(inputs, return_aux=True) # get aux stats
 
             # Task loss
             ce = criterion(outputs, targets)
@@ -303,9 +303,9 @@ class Simple_Moe(nn.Module):
 
             # Accuracy & loss stats
             running_loss += float(total_loss.item()) * inputs.size(0)
-            _, preds = outputs.max(1)
+            _, preds = outputs.max(1) # predicted classes
             correct += preds.eq(targets).sum().item()
-            total += targets.size(0)
+            total += targets.size(0) # total number of samples
 
         avg_loss = running_loss / total if total > 0 else 0.0
         acc = correct / total if total > 0 else 0.0
@@ -343,7 +343,7 @@ class Simple_Moe(nn.Module):
 
             # Predicted class is the argmax over logits
             _, preds = outputs.max(1)
-            correct += preds.eq(targets).sum().item()
+            correct += preds.eq(targets).sum().item() # count correct predictions
             total += targets.size(0)
 
         # Return accuracy (fraction correct). If dataset is empty, return 0.0 to avoid div/0.
