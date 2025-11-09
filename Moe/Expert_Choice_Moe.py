@@ -126,7 +126,7 @@ class Expert_Choice(nn.Module):
 
         # 3) EC selection: per-expert top-M over tokens
         E = self.num_experts
-        M = self._bucket_size(B)
+        M = self._bucket_size(B) # per-expert capacity
         selected = torch.zeros(B, E, dtype=torch.bool, device=device)
         per_expert_counts = torch.zeros(E, dtype=torch.long, device=device)
         overflow_dropped  = torch.zeros(E, dtype=torch.long, device=device)  # EC is 0 as placeholder
@@ -134,29 +134,29 @@ class Expert_Choice(nn.Module):
         for e in range(E):
             col = sel_scores[:, e]                   # [B]
             if M >= B:
-                idx = torch.arange(B, device=device)
+                idx = torch.arange(B, device=device) # [B]
                 Be = B
             else:
                 idx = torch.topk(col, k=M, dim=0).indices  # [M]
                 Be = M
-            selected[idx, e] = True
-            per_expert_counts[e] = Be
+            selected[idx, e] = True # set selected tokens
+            per_expert_counts[e] = Be # number of tokens assigned to expert e
 
         # 4) aggregate: uniform 1/m
-        out_dim = self.experts[0].layer2.out_features
-        combined = features.new_zeros((B, out_dim))
-        m = selected.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+        out_dim = self.experts[0].layer2.out_features # read dynamically
+        combined = features.new_zeros((B, out_dim)) # [B, out_dim], initialized to 0
+        m = selected.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1], num experts that selected each token
 
         for e in range(E):
-            token_idx = torch.nonzero(selected[:, e], as_tuple=False).view(-1)  # [Be]
+            token_idx = torch.nonzero(selected[:, e], as_tuple=False).view(-1)  # [Be], indices of tokens for expert e
             if token_idx.numel() == 0:
                 continue
-            y_e = self.experts[e](features[token_idx])                          # [Be, out_dim]
-            w_e = (1.0 / m[token_idx]).to(y_e.dtype)                            # [Be, 1]
-            combined[token_idx] += w_e * y_e
+            y_e = self.experts[e](features[token_idx])                          # [Be, out_dim], expert outputs
+            w_e = (1.0 / m[token_idx]).to(y_e.dtype)                            # [Be, 1], uniform weight 1/m
+            combined[token_idx] += w_e * y_e # accumulate expert outputs
 
         # 5) aux
-        if return_aux:
+        if return_aux: # return aux stats for logging
             routing_entropy = (-gate_probs.clamp_min(1e-12).log() * gate_probs).sum(dim=1).mean()
             aux = {
                 "gate_scores": raw_scores.detach(),         # we log RAW (selection used raw or noisy)
@@ -188,18 +188,19 @@ class Expert_Choice(nn.Module):
 
         for batch_idx, (inputs, targets) in enumerate(loader):
             if max_batches is not None and batch_idx >= max_batches:
-                break
+                break # break if reached max batches for this epoch
 
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            inputs = inputs.to(device, non_blocking=True) # [B, C, H, W]
+            targets = targets.to(device, non_blocking=True) # [B]
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True) # zero grads
 
-            outputs, _aux = self.forward(inputs, return_aux=True)
+            outputs, _aux = self.forward(inputs, return_aux=True) # forward pass
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
 
+            # compute loss & accuracy stats
             running_loss += float(loss.item()) * inputs.size(0)
             correct += outputs.argmax(1).eq(targets).sum().item()
             total += targets.size(0)
@@ -238,7 +239,7 @@ if __name__ == "__main__":
 
     # Build EC model
     model = Expert_Choice(
-        num_experts=6,
+        num_experts=16,
         backbone_structure="resnet18",
         backbone_pretrained=False,
         num_features=32,      # a bit larger feature for clearer routing
@@ -247,7 +248,7 @@ if __name__ == "__main__":
         use_noisy_scores=False,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.02)
     EPOCHS = 50
 
     # CIFAR-100 quick run

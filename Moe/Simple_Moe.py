@@ -362,7 +362,7 @@ if __name__ == '__main__':
 
     # Build model: 3 experts, top-1 routing, per-token noise, CV-loss enabled
     model = Simple_Moe(
-        num_experts=3, top_k=1, aux_loss_weight=0.0,
+        num_experts=16, top_k=4, aux_loss_weight=0.0,
         backbone_structure='resnet18', backbone_pretrained=False,
         num_features=32, output_size=100,  # CIFAR-100
         per_token_noise=True, min_noise_scale=1e-2,
@@ -371,7 +371,7 @@ if __name__ == '__main__':
         router_temperature=1.0,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=0.02)
     EPOCHS = 50
 
     # CIFAR-100 quick run
@@ -393,7 +393,7 @@ if __name__ == '__main__':
         for expert in model.experts:
             in_features = expert.layer2.in_features  # consistent with your Expert class
             expert.layer2 = nn.Linear(in_features, 10).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=0.02)
 
     train_loader, test_loader, _ = cifar10.get_dataloaders(
         batch_size=64, num_workers=0, data_dir='./data', download=False
