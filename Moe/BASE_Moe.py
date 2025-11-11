@@ -259,8 +259,8 @@ class BASE_Moe(nn.Module):
                 continue
             y_e = self.experts[e](features[token_idx])                           # [Be, C]
             # accumulate with index_add_ (faster than advanced indexing '+=')
-            combined.index_add_(0, token_idx, y_e)
-            per_expert_counts[e] = token_idx.numel()
+            combined.index_add_(0, token_idx, y_e) # add expert outputs to correct rows
+            per_expert_counts[e] = token_idx.numel() # take count for aux
 
         if return_aux:
             routing_entropy = (-gate_probs.clamp_min(1e-12).log() * gate_probs).sum(dim=1).mean()

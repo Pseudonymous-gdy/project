@@ -362,12 +362,12 @@ if __name__ == '__main__':
 
     # Build model: 3 experts, top-1 routing, per-token noise, CV-loss enabled
     model = Simple_Moe(
-        num_experts=16, top_k=4, aux_loss_weight=0.0,
+        num_experts=16, top_k=2, aux_loss_weight=0.0,
         backbone_structure='resnet18', backbone_pretrained=False,
         num_features=32, output_size=100,  # CIFAR-100
         per_token_noise=True, min_noise_scale=1e-2,
         w_importance=0.01, w_load=0.01,
-        capacity_factor=1.0, overflow_strategy='drop',
+        capacity_factor=1.5, overflow_strategy='drop',
         router_temperature=1.0,
     ).to(device)
 

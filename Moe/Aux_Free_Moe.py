@@ -306,19 +306,19 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = Aux_Free_Moe(
-        num_experts=6, top_k=1,
+        num_experts=16, top_k=2,
         backbone_structure="resnet18",
         backbone_pretrained=False,
         num_features=32, hidden_size=64, output_size=100,
         per_token_noise=True, min_noise_scale=1e-3,
         router_temperature=1.2,
-        capacity_factor=1.25, overflow_strategy="drop",
+        capacity_factor=1.5, overflow_strategy="drop",
         bias_lr=0.1, ema_decay=0.9, bias_clip=2.0,
         update_bias_in_eval=False,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.02)
-    EPOCHS = 30
+    EPOCHS = 50
 
     # CIFAR-100 quick run
     train_loader, test_loader, _ = cifar100.get_dataloaders(
