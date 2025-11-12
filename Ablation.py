@@ -4,8 +4,8 @@ Ablation runner for Bayesian_NN_Moe (Bayesian router + sparse Top-k).
 What this script does
 ---------------------
 1) Runs a compact sweep over router/ELBO and routing/balance hyperparameters.
-2) Trains via the model's own train_one_epoch (which handles ELBO, KL anneal, aux balance).
-3) After training, probes routing on a few batches to estimate balance metrics (CV/Gini/Overflow/Entropy/NMI).
+2) Trains via the model's own train_one_epoch(...) (which implements ELBO, KL anneal, aux balance).
+3) After training, probes routing on a few batches to estimate load-balance metrics (CV/Gini/Overflow/Entropy/NMI).
 4) Evaluates accuracy, NLL, ECE on the test split.
 5) Plots relationships (Acc–CV, ECE–beta_kl, Overflow–Capacity, Img/s–CV) and saves CSV/JSON summaries.
 6) Picks a "best" config via a simple multi-objective score.
@@ -18,19 +18,18 @@ Assumptions about your model API
       - If return_aux=False -> returns combined_logits
     * train_one_epoch(self, loader, optimizer, device, criterion=None, max_batches=None)
       -> returns (avg_loss, train_accuracy)
-    * evaluate(self, loader, device, max_batches=None)  # optional, but we will not rely on it.
 
-- The aux dict from forward(..., return_aux=True) contains (as implemented in your provided class):
+- The aux dict from forward(..., return_aux=True) contains (as in your class):
     * 'per_expert_counts': LongTensor[E]
     * 'overflow_dropped' : LongTensor[E]
     * 'routing_entropy'  : scalar float tensor
-    * plus various gate info (topk_idx, probs, etc.)
-    * 'kl' is available in forward(return_aux=True) as aux_out['kl'] as well.
+    * 'topk_idx'         : LongTensor[B, k]
+    * 'kl'               : scalar (router KL)
 
 Notes
 -----
 - We DO NOT call forward(x, y=...) anywhere.
-- We capture throughput per epoch by measuring wall time around model.train_one_epoch(...).
+- Throughput is measured per epoch as dataset_size / epoch_wall_time (median across epochs).
 """
 
 import os, sys, time, json, math, argparse, random
@@ -56,14 +55,6 @@ from Moe.Bayesian_NN_Moe import Bayesian_NN_Moe
 def ece_score(logits: torch.Tensor, y: torch.Tensor, n_bins: int = 15) -> float:
     """
     Expected Calibration Error (ECE) with equal-width confidence bins.
-
-    Args:
-        logits: (N, C) raw outputs
-        y     : (N,) labels
-        n_bins: number of bins
-
-    Returns:
-        ECE in [0, 1]
     """
     probs = torch.softmax(logits, dim=1)
     conf, pred = probs.max(1)
@@ -80,9 +71,8 @@ def ece_score(logits: torch.Tensor, y: torch.Tensor, n_bins: int = 15) -> float:
 
 def gini_from_counts(n: np.ndarray) -> float:
     """
-    Gini coefficient for nonnegative counts over experts.
-
-    G = sum_{i,j} |n_i - n_j| / (2 * E * sum_i n_i)
+    Gini coefficient for nonnegative counts over experts:
+        G = sum_{i,j} |n_i - n_j| / (2 * E * sum_i n_i)
     """
     n = np.asarray(n, dtype=np.float64)
     s = n.sum()
@@ -90,6 +80,46 @@ def gini_from_counts(n: np.ndarray) -> float:
         return 0.0
     diffsum = np.abs(n[:, None] - n[None, :]).sum()
     return float(diffsum / (2.0 * len(n) * s))
+
+
+def specialization_nmi(hard_assign: np.ndarray, labels: np.ndarray, num_experts: int) -> float:
+    """
+    Lightweight NMI(X;Y) / max(H(X), H(Y)) without sklearn.
+    X = expert id in [0..E-1], Y = class id.
+
+    Args:
+        hard_assign: (N,) predicted expert ids
+        labels     : (N,) ground-truth class ids
+        num_experts: E
+
+    Returns:
+        NMI in [0,1] or NaN if invalid.
+    """
+    x = np.asarray(hard_assign, dtype=int)
+    y = np.asarray(labels, dtype=int)
+    if x.size == 0:
+        return np.nan
+
+    E = num_experts
+    classes = np.unique(y)
+    eps = 1e-12
+
+    # P(X)
+    Px = np.array([(x == e).mean() for e in range(E)], dtype=np.float64) + eps
+    # P(Y)
+    Py = np.array([(y == c).mean() for c in classes], dtype=np.float64) + eps
+
+    Hx = float(-(Px * np.log(Px)).sum())
+    Hy = float(-(Py * np.log(Py)).sum())
+
+    # I(X;Y)
+    I = 0.0
+    for i, e in enumerate(range(E)):
+        for j, c in enumerate(classes):
+            Pxy = float(((x == e) & (y == c)).mean()) + eps
+            I += Pxy * (math.log(Pxy) - math.log(Px[i]) - math.log(Py[j]))
+
+    return float(I / max(Hx, Hy))
 
 
 # =========================================================
@@ -103,9 +133,11 @@ def get_loaders(dataset: str = "cifar100",
     Return (train_loader, test_loader) from your repo helpers.
     """
     if dataset.lower() == "cifar10":
-        train, test, _ = cifar10.get_dataloaders(batch_size=bs, num_workers=num_workers, data_dir=data_dir, download=False)
+        train, test, _ = cifar10.get_dataloaders(batch_size=bs, num_workers=num_workers,
+                                                 data_dir=data_dir, download=False)
     else:
-        train, test, _ = cifar100.get_dataloaders(batch_size=bs, num_workers=num_workers, data_dir=data_dir, download=False)
+        train, test, _ = cifar100.get_dataloaders(batch_size=bs, num_workers=num_workers,
+                                                  data_dir=data_dir, download=False)
     return train, test
 
 
@@ -129,7 +161,7 @@ def build_model(cfg: Dict[str, Any],
         router_temperature=cfg["tau"],
 
         # capacity control
-        capacity_factor=cfg["capacity"],          # <- name matches your constructor
+        capacity_factor=cfg["capacity"],          # matches your constructor
         overflow_strategy="drop",
 
         # router training mode
@@ -159,34 +191,29 @@ def probe_routing_metrics(model: torch.nn.Module,
                           num_experts: int,
                           max_batches: int = 40) -> Dict[str, float]:
     """
-    Run a light probe over at most `max_batches` of the (train) loader
-    using deterministic expectation path to estimate routing balance.
+    Light probe over at most `max_batches` of the *train* loader to estimate balance.
 
-    We collect:
+    Collects:
       - per_expert_counts (sum across batches)
-      - overflow_dropped   (sum across batches)
-      - routing_entropy    (mean over batches)
-      - a quick specialization NMI via Top-1 expert assignment (first column of topk_idx)
-
-    Returns:
-      dict with cv, gini, overflow, routing_entropy, eeu, nmi
+      - overflow_dropped  (sum across batches)
+      - routing_entropy   (mean over batches)
+      - specialization NMI using Top-1 expert assignment (from aux['topk_idx'][:,0])
     """
     model.eval()
     E = num_experts
     counts = torch.zeros(E, dtype=torch.float64)
     dropped = torch.zeros(E, dtype=torch.float64)
-    entropies = []
-    hard_assign = []
-    labels = []
+    entropies: List[float] = []
+    hard_assign: List[np.ndarray] = []
+    labels: List[np.ndarray] = []
 
-    seen = 0
     for bidx, (xb, yb) in enumerate(loader):
         if bidx >= max_batches:
             break
         xb = xb.to(device, non_blocking=True)
-        # deterministic expectation path with aux
-        logits, aux = model(xb, return_aux=True)
-        # per-expert counts & overflow_dropped
+        logits, aux = model(xb, return_aux=True)  # deterministic expectation path with aux
+
+        # per-expert counts & overflow
         pec = aux.get("per_expert_counts", None)
         ofd = aux.get("overflow_dropped", None)
         if pec is not None:
@@ -194,41 +221,33 @@ def probe_routing_metrics(model: torch.nn.Module,
         if ofd is not None:
             dropped += ofd.detach().cpu().to(torch.float64)
 
-        # entropy (scalar per batch)
+        # entropy
         if "routing_entropy" in aux:
             entropies.append(float(aux["routing_entropy"].detach().cpu().item()))
 
-        # hard assignment from topk_idx (use the first top-1 index)
+        # top-1 expert id for NMI
         tki = aux.get("topk_idx", None)
         if tki is not None:
             ha = tki[:, 0].detach().cpu().numpy()
             hard_assign.append(ha)
             labels.append(yb.numpy())
 
-        seen += xb.size(0)
-
-    # Aggregate per-expert
-    cv, gini, eeu, overflow_rate = np.nan, np.nan, np.nan, np.nan
+    # Aggregate
     counts_np = counts.numpy()
     total_kept = counts_np.sum()
     total_dropped = dropped.numpy().sum()
     total_attempt = total_kept + total_dropped
 
-    if total_kept > 0:
-        cv = float(counts_np.std() / (counts_np.mean() + 1e-8))
-        gini = gini_from_counts(counts_np)
-        eeu = float((counts_np > 0).mean())
-    if total_attempt > 0:
-        overflow_rate = float(total_dropped / total_attempt)
-
+    cv = float(counts_np.std() / (counts_np.mean() + 1e-8)) if total_kept > 0 else np.nan
+    gini = gini_from_counts(counts_np) if total_kept > 0 else np.nan
+    eeu = float((counts_np > 0).mean()) if total_kept > 0 else np.nan
+    overflow_rate = float(total_dropped / total_attempt) if total_attempt > 0 else np.nan
     routing_entropy = float(np.mean(entropies)) if len(entropies) > 0 else np.nan
 
-    # NMI specialization (hard_assign vs labels)
     nmi = np.nan
     if len(hard_assign) > 0 and len(labels) > 0:
         ha = np.concatenate(hard_assign, axis=0)
         lb = np.concatenate(labels, axis=0)
-        # small helper: NMI
         nmi = specialization_nmi(ha, lb, E)
 
     return dict(cv=cv, gini=gini, overflow=overflow_rate,
@@ -243,15 +262,13 @@ def evaluate(model: torch.nn.Module,
              loader: DataLoader,
              device: str) -> Dict[str, float]:
     """
-    Simple evaluation (deterministic expected path):
-    - logits = model(x, return_aux=False)
-    - compute accuracy, NLL, ECE
+    Deterministic evaluation using model(x, return_aux=False).
     """
     model.eval()
     logits_all, y_all = [], []
     for xb, yb in loader:
         xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-        logits = model(xb, return_aux=False)  # <-- no 'y=' here
+        logits = model(xb, return_aux=False)
         logits_all.append(logits.detach().cpu())
         y_all.append(yb.detach().cpu())
 
@@ -269,15 +286,14 @@ def evaluate(model: torch.nn.Module,
 # =========================================================
 def score_row(r: Dict[str, Any]) -> float:
     """
-    Higher is better (acc, img_s), lower is better (nll, ece, cv, gini, overflow).
-    Weights are simple and can be tuned.
+    Higher is better (acc, img_s); lower is better (nll, ece, cv, gini, overflow).
     """
     s = 0.0
     s += 2.0 * r.get("acc", 0.0)                  # accuracy dominates
     s += 0.5 * r.get("img_s_norm", 0.0)           # normalized throughput
     s -= 0.5 * r.get("nll", 2.0)
-    s -= 1.0 * r.get("ece", 0.1) * 10             # scale ECE to ~[0,2]
-    s -= 0.5 * r.get("cv", 0.5)                   # balance
+    s -= 1.0 * r.get("ece", 0.1) * 10             # bring ECE to ~[0,2]
+    s -= 0.5 * r.get("cv", 0.5)
     s -= 0.25 * r.get("gini", 0.3)
     s -= 0.5 * r.get("overflow", 0.0) * 100       # overflow in %
     return float(s)
@@ -288,7 +304,7 @@ def score_row(r: Dict[str, Any]) -> float:
 # =========================================================
 def default_base(output_size: int) -> Dict[str, Any]:
     """
-    Reasonable starting point. Adjust epochs/seeds for debug vs paper results.
+    Reasonable starting point. Adjust epochs/seeds for debug vs paper-grade runs.
     """
     return dict(
         dataset="cifar100",
@@ -423,7 +439,7 @@ def run(args):
                     loader=train_loader,
                     optimizer=opt,
                     device=device,
-                    criterion=None,         # model uses nn.CrossEntropyLoss() internally if None
+                    criterion=None,         # model uses CE internally if None
                     max_batches=None
                 )
 
@@ -543,8 +559,8 @@ if __name__ == "__main__":
                     help="Dataset choice")
     ap.add_argument("--datadir", type=str, default="./data", help="Data directory")
     ap.add_argument("--bs", type=int, default=64, help="Batch size")
-    ap.add_argument("--workers", type=int, default=4, help="DataLoader workers")
-    ap.add_argument("--epochs", type=int, default=40, help="Training epochs per sweep variant")
-    ap.add_argument("--seeds", type=str, default="0,1,2", help="Comma-separated seeds, e.g. '0,1,2'")
+    ap.add_argument("--workers", type=int, default=0, help="DataLoader workers")
+    ap.add_argument("--epochs", type=int, default=1, help="Training epochs per sweep variant")
+    ap.add_argument("--seeds", type=str, default="0", help="Comma-separated seeds, e.g. '0,1,2'")
     args = ap.parse_args()
     run(args)
