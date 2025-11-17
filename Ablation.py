@@ -383,7 +383,7 @@ def probe_routing_metrics(
 
         if denom > 0.0:
             I = 0.0
-            for e in range(E):
+            for e in range(num_experts):
                 for c in range(num_classes):
                     p_ec = P_ec[e, c]
                     if p_ec <= 0.0:
@@ -687,7 +687,24 @@ def run(args: argparse.Namespace):
       4) Normalize throughput, compute composite scores, pick the best row.
       5) Save CSVs, JSON, and generate several diagnostic plots.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # ---------------- Device and GPU usage ----------------
+    # We decide whether to use CUDA based on:
+    #   - torch.cuda.is_available()
+    #   - args.num_gpus: if 0, force CPU even if CUDA is available.
+    use_cuda = torch.cuda.is_available() and (args.num_gpus > 0)
+    device = "cuda" if use_cuda else "cpu"
+
+    # world_size controls how we partition the sweep_list across processes.
+    # It is typically the total number of GPUs (i.e., processes), but we
+    # fall back to 1 when num_gpus == 0 so that all sweeps run on CPU.
+    world_size = args.num_gpus if args.num_gpus > 0 else 1
+
+    print(
+        f"[INFO] device={device}, "
+        f"num_gpus_arg={args.num_gpus}, world_size={world_size}, "
+        f"sweep_offset={args.sweep_offset}",
+        flush=True,
+    )
 
     # -----------------------------------------------------
     # 1. Dataset & loaders
@@ -721,6 +738,15 @@ def run(args: argparse.Namespace):
     # 3. Iterate over sweep variants & seeds
     # -----------------------------------------------------
     for i, delta in enumerate(sweeps):
+        # Coarse-grained multi-GPU parallelism:
+        # If world_size > 1, each process (identified by sweep_offset)
+        # is responsible only for sweeps with index i such that:
+        #   i % world_size == args.sweep_offset.
+        # This allows you to launch one process per GPU with different
+        # sweep_offset values.
+        if world_size > 1 and (i % world_size != args.sweep_offset):
+            continue
+
         # Merge base config with this sweep's delta
         cfg = {**base, **delta}
         sweep_name = cfg.get("name", f"sweep_{i}")
@@ -750,7 +776,8 @@ def run(args: argparse.Namespace):
                 print(f"[sweep={i} '{sweep_name}' seed={seed}] "
                       f"Warm-up for {warmup_epochs} epochs...", flush=True)
                 for ep in range(warmup_epochs):
-                    if torch.cuda.is_available():
+                    # Synchronize CUDA before and after timing if we are on GPU
+                    if use_cuda:
                         torch.cuda.synchronize()
                     t0 = time.time()
 
@@ -762,7 +789,7 @@ def run(args: argparse.Namespace):
                         max_batches=None,   # use full epoch for warm-up
                     )
 
-                    if torch.cuda.is_available():
+                    if use_cuda:
                         torch.cuda.synchronize()
                     t1 = time.time()
 
@@ -781,7 +808,7 @@ def run(args: argparse.Namespace):
                   f"Main training for {cfg['epochs']} epochs...", flush=True)
 
             for ep in range(cfg["epochs"]):
-                if torch.cuda.is_available():
+                if use_cuda:
                     torch.cuda.synchronize()
                 t0 = time.time()
 
@@ -793,7 +820,7 @@ def run(args: argparse.Namespace):
                     max_batches=None,       # full pass over train set
                 )
 
-                if torch.cuda.is_available():
+                if use_cuda:
                     torch.cuda.synchronize()
                 t1 = time.time()
 
@@ -1026,5 +1053,39 @@ if __name__ == "__main__":
         default="0",
         help="Comma-separated seeds, e.g. '0,1,2'.",
     )
+
+    # ---------- New CLI arguments for GPU / sweep parallelism ----------
+    # num_gpus:
+    #   - default is 1 if CUDA is available, otherwise 0.
+    #   - interpreted as the total number of GPUs (i.e., concurrent processes)
+    #     used for coarse-grained sweep parallelism.
+    default_num_gpus = 1 if torch.cuda.is_available() else 0
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=default_num_gpus,
+        help=(
+            "Total number of GPUs used for coarse-grained sweep parallelism. "
+            "If 0, the script runs on CPU only. "
+            "Typically you launch one process per GPU with the same --num-gpus."
+        ),
+    )
+
+    # sweep_offset:
+    #   - which remainder class this process is responsible for when partitioning
+    #     sweep_list by index modulo num_gpus.
+    #   - for example, with --num-gpus=2, you can launch two processes with
+    #     --sweep-offset=0 and --sweep-offset=1, each running half of the sweeps.
+    parser.add_argument(
+        "--sweep-offset",
+        type=int,
+        default=0,
+        help=(
+            "Index of this process in [0, num_gpus-1] for partitioning the "
+            "sweep_list. Only sweeps with index % num_gpus == sweep_offset "
+            "are executed by this process."
+        ),
+    )
+
     args = parser.parse_args()
     run(args)
