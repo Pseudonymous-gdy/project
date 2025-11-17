@@ -1,8 +1,12 @@
-import os, sys
+import os
+import sys
+
+# Ensure project root is on sys.path when running this file directly
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 """
-Bayesian_NN_Moe (unified style, fixed F alias)
+Bayesian_NN_Moe (unified style, fixed F alias, AMP-enabled)
+
 - Bayesian router only (factorized Gaussian over W,b)
 - Two training modes:
     * 'expected': logistic-normal expectation (deterministic, low-variance)
@@ -10,14 +14,21 @@ Bayesian_NN_Moe (unified style, fixed F alias)
 - Sparse Top-k routing with strict truncation & renormalization
 - Optional capacity per expert; efficient dispatch with index_add_
 - Public API & aux dict fields are aligned with other MoE modules
+
+Acceleration for modern GPUs (A100 / A800 / RTX 4090 etc., common PyTorch):
+- Mixed precision training via torch.cuda.amp.autocast + GradScaler
+- Non-blocking .to(device) transfers
+- Optional channels-last memory format for 4D image tensors
 """
 
 from typing import Optional, Tuple, Dict
 import math
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as Fnn   # <-- avoid name clash with local variables
+import torch.nn.functional as Fnn  # avoid name clash with local variables
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
 # project-local
 import cifar10
@@ -52,6 +63,10 @@ class Bayesian_NN_Moe(nn.Module):
         - Sample router parameters via reparameterization.
         - Use sampled gate scores + balanced greedy Top-k assignment.
         - Train only on data loss (no KL) to obtain a good, balanced prior.
+
+    Acceleration:
+        - Uses torch.cuda.amp.autocast + GradScaler during train_one_epoch
+          and train_one_epoch_warmup when CUDA is available and use_amp=True.
     """
 
     def __init__(
@@ -80,6 +95,9 @@ class Bayesian_NN_Moe(nn.Module):
         # (optional) small balance losses if you want parity with Simple_Moe
         w_importance: float = 0.0,
         w_load: float = 0.0,
+        # AMP / mixed precision options
+        use_amp: bool = True,
+        amp_dtype: torch.dtype = torch.bfloat16,  # good default for A100/A800/4090
     ) -> None:
         super().__init__()
         assert num_experts >= 1 and top_k >= 1
@@ -103,6 +121,13 @@ class Bayesian_NN_Moe(nn.Module):
         self.w_importance = float(w_importance)
         self.w_load = float(w_load)
 
+        # Mixed precision configuration
+        # Enabled only when CUDA is present.
+        self.use_amp = bool(use_amp) and torch.cuda.is_available()
+        self.amp_dtype = amp_dtype
+        # GradScaler safely scales the loss for fp16/bf16 backprop
+        self.scaler = GradScaler(enabled=self.use_amp)
+
         # Deterministic backbone and experts
         self.Back_bone = Backbone(
             structure=backbone_structure,
@@ -110,8 +135,10 @@ class Bayesian_NN_Moe(nn.Module):
             num_features=num_features,
         )
         self.experts = nn.ModuleList(
-            [Expert(num_features=num_features, hidden_size=hidden_size, output_size=output_size)
-             for _ in range(self.num_experts)]
+            [
+                Expert(num_features=num_features, hidden_size=hidden_size, output_size=output_size)
+                for _ in range(self.num_experts)
+            ]
         )
 
         # Router variational parameters
@@ -123,7 +150,7 @@ class Bayesian_NN_Moe(nn.Module):
         nn.init.xavier_uniform_(self.W_mu)
         nn.init.zeros_(self.b_mu)
 
-        # step counter for KL warm-up
+        # Step counter for KL warm-up
         self.register_buffer("_train_step", torch.tensor(0, dtype=torch.long))
 
     # ----------------------------- math utils -----------------------------
@@ -143,26 +170,30 @@ class Bayesian_NN_Moe(nn.Module):
 
     @staticmethod
     def _logistic_normal_shrink(mu_m: torch.Tensor, var_m: torch.Tensor) -> torch.Tensor:
-        """tilde_m = mu / sqrt(1 + (π/8) * var)."""
+        """Compute tilde_m = mu / sqrt(1 + (π/8) * var)."""
         return mu_m / torch.sqrt(1.0 + (math.pi / 8.0) * var_m)
 
     def _kl_router(self) -> torch.Tensor:
-        """KL[q(W,b)||p(W,b)] with prior variance router_prior_var."""
+        """KL[q(W,b)||p(W,b)] with isotropic Gaussian prior of variance router_prior_var."""
         var_p = self.router_prior_var
         var_q_W = torch.exp(self.W_logvar)
         var_q_b = torch.exp(self.b_logvar)
+
         kl_W = 0.5 * torch.sum(
-            torch.log(var_p / (var_q_W + 1e-12)) + (var_q_W + self.W_mu**2) / var_p - 1.0
+            torch.log(var_p / (var_q_W + 1e-12)) + (var_q_W + self.W_mu ** 2) / var_p - 1.0
         )
         kl_b = 0.5 * torch.sum(
-            torch.log(var_p / (var_q_b + 1e-12)) + (var_q_b + self.b_mu**2) / var_p - 1.0
+            torch.log(var_p / (var_q_b + 1e-12)) + (var_q_b + self.b_mu ** 2) / var_p - 1.0
         )
         return kl_W + kl_b
 
     def _kl_weight(self) -> float:
         """
-        Linear KL warm-up:
-          beta_kl * min(1, t / kl_anneal_steps)
+        Linear KL warm-up schedule:
+
+            effective_beta = beta_kl * min(1, t / kl_anneal_steps)
+
+        where t is the number of training steps so far.
         """
         if not self.kl_anneal_steps or self.kl_anneal_steps <= 0:
             return self.beta_kl
@@ -175,6 +206,7 @@ class Bayesian_NN_Moe(nn.Module):
 
         capacity_factor = 1.0  -> 'fair share'
         capacity_factor > 1.0  -> allow overflow
+        capacity_factor is None -> unlimited capacity
         """
         if self.capacity_factor is None:
             return None
@@ -184,7 +216,7 @@ class Bayesian_NN_Moe(nn.Module):
 
     @staticmethod
     def _cv2(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-        """Coefficient of variation squared."""
+        """Coefficient of variation squared, v / (m^2), with small numerical guard."""
         m = x.mean()
         v = x.var(unbiased=False)
         return v / (m * m + eps)
@@ -256,9 +288,9 @@ class Bayesian_NN_Moe(nn.Module):
             token_idx = torch.nonzero(appear_mask, as_tuple=False).view(-1)  # [Be]
             Be = token_idx.numel()
 
-            # capacity per expert (keep tokens with largest mixing weight for this expert)
+            # Capacity per expert (keep tokens with largest mixing weight for this expert)
             if capacity is not None and Be > capacity:
-                # compute weights for expert e among selected tokens
+                # Compute weights for expert e among selected tokens
                 w_tmp = (topk_idx[token_idx] == e).float()               # [Be,k] indicator
                 w_tmp = (topk_weights[token_idx] * w_tmp).sum(dim=1)     # [Be]
                 vals, order = torch.sort(w_tmp, descending=True)
@@ -297,10 +329,16 @@ class Bayesian_NN_Moe(nn.Module):
 
     def forward(self, x: torch.Tensor, *, return_aux: bool = False):
         """
-        Deterministic evaluation path:
-          - compute (mu,var), shrink to tilde_m, route with Top-k on tilde_m
+        Deterministic evaluation path (no Monte-Carlo samples):
+
+          - Compute (mu,var), shrink to tilde_m.
+          - Route with Top-k on tilde_m.
           - softmax(tilde_m/T) truncated & renormalized, mix experts.
         """
+        # Optional channels-last layout for 4D image tensors on CUDA
+        if x.dim() == 4 and x.is_cuda:
+            x = x.to(memory_format=torch.channels_last)
+
         h = self.Back_bone(x)                               # [B,F]
         mu_m, var_m = self._router_moments(h)               # [B,E]
         tilde_m = self._logistic_normal_shrink(mu_m, var_m) # [B,E]
@@ -308,18 +346,24 @@ class Bayesian_NN_Moe(nn.Module):
 
         if return_aux:
             aux_out = dict(aux)
-            aux_out.update({
-                "mu_logits": mu_m.detach(),
-                "var_logits": var_m.detach(),
-                "kl": self._kl_router(),                    # tensor (not detached) used in train
-            })
+            aux_out.update(
+                {
+                    "mu_logits": mu_m.detach(),
+                    "var_logits": var_m.detach(),
+                    "kl": self._kl_router(),  # tensor (not detached) used in train
+                }
+            )
             return combined, aux_out
         return combined
 
     # --------------------------- data terms (train) ---------------------------
 
-    def _data_term_expected(self, h: torch.Tensor, targets: torch.Tensor,
-                            criterion: nn.Module) -> Tuple[torch.Tensor, Dict]:
+    def _data_term_expected(
+        self,
+        h: torch.Tensor,
+        targets: torch.Tensor,
+        criterion: nn.Module,
+    ) -> Tuple[torch.Tensor, Dict]:
         """
         Deterministic surrogate of E_q[-log p(y|x,m)] using logistic-normal expectation.
         """
@@ -330,12 +374,17 @@ class Bayesian_NN_Moe(nn.Module):
         aux.update({"mu_logits": mu_m.detach(), "var_logits": var_m.detach()})
         return ce, aux
 
-    def _data_term_mc(self, h: torch.Tensor, targets: torch.Tensor,
-                      criterion: nn.Module) -> Tuple[torch.Tensor, Dict]:
+    def _data_term_mc(
+        self,
+        h: torch.Tensor,
+        targets: torch.Tensor,
+        criterion: nn.Module,
+    ) -> Tuple[torch.Tensor, Dict]:
         """
         Monte-Carlo estimate of E_q[-log p(y|x,m)] with S samples.
 
         Optional control variate: subtract a no-grad baseline based on tilde_m.
+
         criterion: nn.Module that returns per-batch mean loss.
         """
         mu_m, var_m = self._router_moments(h)
@@ -370,10 +419,15 @@ class Bayesian_NN_Moe(nn.Module):
 
     # ------------------------------ balance loss ------------------------------
 
-    def _aux_balance_loss(self, gate_probs: torch.Tensor, topk_idx: torch.Tensor,
-                          per_expert_counts: Optional[torch.Tensor]) -> torch.Tensor:
+    def _aux_balance_loss(
+        self,
+        gate_probs: torch.Tensor,
+        topk_idx: torch.Tensor,
+        per_expert_counts: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         """
         Optional CV^2 balancing (kept for parity with Simple_Moe).
+
         Set w_importance=w_load=0 to disable.
         """
         if self.w_importance == 0.0 and self.w_load == 0.0:
@@ -387,23 +441,33 @@ class Bayesian_NN_Moe(nn.Module):
             B, E = gate_probs.shape
             onehot = torch.zeros(B, E, device=gate_probs.device, dtype=gate_probs.dtype)
             for j in range(topk_idx.size(1)):
-                onehot.scatter_add_(1, topk_idx[:, j:j+1], torch.ones_like(onehot[:, :1]))
+                onehot.scatter_add_(1, topk_idx[:, j:j + 1], torch.ones_like(onehot[:, :1]))
             load = onehot.sum(dim=0)
         loss_load = self._cv2(load) * self.w_load
         return loss_imp + loss_load
 
     # ------------------------------ train / eval ------------------------------
 
-    def train_one_epoch(self, loader: DataLoader, optimizer: torch.optim.Optimizer,
-                        device: torch.device, criterion: Optional[nn.Module] = None,
-                        max_batches: Optional[int] = None):
+    def train_one_epoch(
+        self,
+        loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        criterion: Optional[nn.Module] = None,
+        max_batches: Optional[int] = None,
+    ):
         """
         Train one epoch on the full Bayesian-ELBO objective:
 
-          - compute features once
-          - data term: 'expected' (deterministic) or 'mc' (ELBO with S samples)
-          - add annealed KL and optional (small) balance loss
-          - accuracy is computed via deterministic expected path
+          - Compute features once (inside AMP autocast when enabled).
+          - Data term: 'expected' (deterministic) or 'mc' (ELBO with S samples).
+          - Add annealed KL and optional (small) balance loss.
+          - Accuracy is computed via deterministic expected path (no grad).
+
+        AMP behavior:
+          - If self.use_amp is True and CUDA is available:
+              * Forward + loss are computed under autocast(enabled=True).
+              * Backward uses GradScaler.
         """
         if criterion is None:
             criterion = nn.CrossEntropyLoss()
@@ -415,32 +479,48 @@ class Bayesian_NN_Moe(nn.Module):
             if max_batches is not None and bidx >= max_batches:
                 break
 
+            # Non-blocking transfer; channels-last for 4D image tensors.
             inputs = inputs.to(device, non_blocking=True)
+            if inputs.dim() == 4 and inputs.is_cuda:
+                inputs = inputs.to(memory_format=torch.channels_last)
             targets = targets.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            # 1) features once
-            h = self.Back_bone(inputs)
+            # Forward + loss inside autocast when AMP is enabled.
+            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                # 1) Features once
+                h = self.Back_bone(inputs)
 
-            # 2) data term
-            if self.router_mode == "expected":
-                ce, aux = self._data_term_expected(h, targets, criterion)
+                # 2) Data term
+                if self.router_mode == "expected":
+                    ce, aux = self._data_term_expected(h, targets, criterion)
+                else:
+                    ce, aux = self._data_term_mc(h, targets, criterion)
+
+                # 3) KL (per-batch scaling) + optional small balance loss
+                kl_term = self._kl_weight() * self._kl_router() / max(1, inputs.shape[0])
+                bal = self._aux_balance_loss(
+                    aux["gate_probs"], aux["topk_idx"], aux["per_expert_counts"]
+                )
+
+                loss = ce + kl_term + bal
+
+            # Backward and optimizer step
+            if self.use_amp:
+                # Mixed-precision backward with dynamic loss scaling
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
             else:
-                ce, aux = self._data_term_mc(h, targets, criterion)
+                loss.backward()
+                optimizer.step()
 
-            # 3) KL (per-batch scaling) + optional small balance loss
-            kl_term = self._kl_weight() * self._kl_router() / max(1, inputs.shape[0])
-            bal = self._aux_balance_loss(aux["gate_probs"], aux["topk_idx"], aux["per_expert_counts"])
-
-            loss = ce + kl_term + bal
-            loss.backward()
-            optimizer.step()
-
+            # Update KL warm-up step counter
             with torch.no_grad():
                 self._train_step.add_(1)
 
-            # accuracy via deterministic expected path
+            # Accuracy via deterministic expected path (no gradient required)
             with torch.no_grad():
                 mu_m, var_m = self._router_moments(h)
                 tilde_m = self._logistic_normal_shrink(mu_m, var_m)
@@ -455,9 +535,17 @@ class Bayesian_NN_Moe(nn.Module):
         return avg_loss, acc
 
     @torch.no_grad()
-    def evaluate(self, loader: DataLoader, device: torch.device, max_batches: Optional[int] = None) -> float:
+    def evaluate(
+        self,
+        loader: DataLoader,
+        device: torch.device,
+        max_batches: Optional[int] = None,
+    ) -> float:
         """
         Deterministic evaluation using the logistic-normal expectation path.
+
+        Note: We do NOT use AMP or GradScaler here; this function is
+        decorated with @torch.no_grad() to disable gradient tracking.
         """
         self.eval()
         correct, total = 0, 0
@@ -465,6 +553,8 @@ class Bayesian_NN_Moe(nn.Module):
             if max_batches is not None and bidx >= max_batches:
                 break
             inputs = inputs.to(device, non_blocking=True)
+            if inputs.dim() == 4 and inputs.is_cuda:
+                inputs = inputs.to(memory_format=torch.channels_last)
             targets = targets.to(device, non_blocking=True)
 
             logits = self.forward(inputs, return_aux=False)  # deterministic path
@@ -643,6 +733,9 @@ class Bayesian_NN_Moe(nn.Module):
         device = x.device
         B = x.size(0)
 
+        if x.dim() == 4 and x.is_cuda:
+            x = x.to(memory_format=torch.channels_last)
+
         # 1) features
         h = self.Back_bone(x)  # [B, F]
 
@@ -655,9 +748,7 @@ class Bayesian_NN_Moe(nn.Module):
 
         # 3) balanced Top-k assignment (greedy, BASE-style but Bayesian scores)
         #    Here we recommend k_warmup = self.top_k to keep the sparsity pattern
-        #    compatible with the main training regime. If you want a slightly denser
-        #    warm-up (more overlap between experts), you may try:
-        #       k_warmup = int(math.ceil(1.5 * self.top_k))
+        #    compatible with the main training regime.
         k_warmup = max(1, min(self.top_k, self.num_experts))
         topk_idx = self._warmup_assign_greedy_topk(gate_scores, k_warmup)  # [B, k_warmup]
 
@@ -690,7 +781,7 @@ class Bayesian_NN_Moe(nn.Module):
         if not return_aux:
             return combined
 
-        # logging fields kept API-compatible with other MoE modules
+        # Logging fields kept API-compatible with other MoE modules
         routing_entropy = (-gate_probs.clamp_min(1e-12).log() * gate_probs).sum(dim=1).mean()
         overflow_dropped = torch.zeros(self.num_experts, dtype=torch.long, device=device)
         total_slots = B * k_warmup
@@ -725,29 +816,37 @@ class Bayesian_NN_Moe(nn.Module):
           - Does NOT touch self._train_step (so KL annealing for real training
             starts fresh after warm-up).
 
-        Goal:
-          - Get a reasonable, load-balanced *router prior* and a good initial
-            expert specialization before turning on the full ELBO.
+        AMP behavior:
+          - Same as train_one_epoch: forward + loss under autocast when enabled.
         """
         if criterion is None:
             criterion = nn.CrossEntropyLoss()
 
         self.train()
-        running_loss, correct, total = 0, 0, 0
+        running_loss, correct, total = 0.0, 0, 0
 
         for bidx, (inputs, targets) in enumerate(loader):
             if max_batches is not None and bidx >= max_batches:
                 break
 
             inputs = inputs.to(device, non_blocking=True)
+            if inputs.dim() == 4 and inputs.is_cuda:
+                inputs = inputs.to(memory_format=torch.channels_last)
             targets = targets.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            outputs, _aux = self.forward_warmup(inputs, return_aux=True)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                outputs, _aux = self.forward_warmup(inputs, return_aux=True)
+                loss = criterion(outputs, targets)
+
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             running_loss += float(loss.item()) * inputs.size(0)
             correct += outputs.argmax(1).eq(targets).sum().item()
@@ -766,6 +865,8 @@ class Bayesian_NN_Moe(nn.Module):
     ) -> float:
         """
         Evaluation under the warm-up routing scheme (forward_warmup).
+
+        Uses @torch.no_grad() to disable gradients for speed and memory savings.
         """
         self.eval()
         correct, total = 0, 0
@@ -774,6 +875,8 @@ class Bayesian_NN_Moe(nn.Module):
                 break
 
             inputs = inputs.to(device, non_blocking=True)
+            if inputs.dim() == 4 and inputs.is_cuda:
+                inputs = inputs.to(memory_format=torch.channels_last)
             targets = targets.to(device, non_blocking=True)
 
             logits = self.forward_warmup(inputs, return_aux=False)
@@ -787,28 +890,54 @@ class Bayesian_NN_Moe(nn.Module):
 # ------------------ Minimal quick test ------------------
 if __name__ == "__main__":
     """
-    (A) Randomized smoke
-    (B) Tiny CIFAR sanity runs for warm-up + 'expected' mode
+    (A) Randomized smoke test.
+    (B) Tiny CIFAR sanity runs for warm-up + 'expected' mode.
+
+    Notes for high-performance GPUs (A100 / A800 / RTX 4090 etc.):
+      - torch.backends.cudnn.benchmark is enabled for faster convolutions.
+      - torch.set_float32_matmul_precision('high') is used when available
+        to unlock Tensor Core acceleration for float32 matmuls.
+      - Mixed precision (bfloat16 by default) is enabled inside the model
+        when CUDA is present.
     """
     torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
     print("Running basic unit test for Bayesian_NN_Moe...")
 
-    # (A) smoke
+    # (A) Smoke test with random input
     B, C, H, W = 8, 3, 32, 32
-    E, Fdim, O = 6, 32, 10  # <-- avoid shadowing functional alias
+    E, Fdim, O = 6, 32, 10  # avoid shadowing functional alias
     x = torch.randn(B, C, H, W, device=device)
 
     model = Bayesian_NN_Moe(
-        num_experts=E, num_features=Fdim, output_size=O, top_k=3,
-        router_prior_var=1.0, beta_kl=1e-3, kl_anneal_steps=500,
-        backbone_structure="resnet18", backbone_pretrained=False, hidden_size=64,
-        capacity_factor=1.0, router_temperature=1.2,
-        router_mode="expected", w_importance=0.0, w_load=0.0,
+        num_experts=E,
+        num_features=Fdim,
+        output_size=O,
+        top_k=3,
+        router_prior_var=1.0,
+        beta_kl=1e-3,
+        kl_anneal_steps=500,
+        backbone_structure="resnet18",
+        backbone_pretrained=False,
+        hidden_size=64,
+        capacity_factor=1.0,
+        router_temperature=1.2,
+        router_mode="expected",
+        w_importance=0.0,
+        w_load=0.0,
+        use_amp=True,              # enable AMP for GPUs that support it
+        amp_dtype=torch.bfloat16,  # good default for A100/A800/RTX 4090
     ).to(device)
 
-    # check main deterministic forward
+    # Check main deterministic forward
     logits, aux = model.forward(x, return_aux=True)
     assert logits.shape == (B, O)
     assert torch.isfinite(logits).all()
@@ -816,7 +945,7 @@ if __name__ == "__main__":
     assert model._kl_router().item() >= 0.0
     print("[UnitTest A] expected path OK")
 
-    # check warm-up forward (Bayesian + balanced Top-k)
+    # Check warm-up forward (Bayesian + balanced Top-k)
     logits_warm, aux_warm = model.forward_warmup(x, return_aux=True)
     assert logits_warm.shape == (B, O)
     assert torch.isfinite(logits_warm).all()
@@ -828,11 +957,23 @@ if __name__ == "__main__":
 
     # CIFAR-100: warm-up then expected path
     model = Bayesian_NN_Moe(
-        num_experts=16, num_features=32, output_size=100, top_k=2,
-        router_prior_var=10.0, beta_kl=1e-6, kl_anneal_steps=5000,
-        backbone_structure="resnet18", backbone_pretrained=False, hidden_size=64,
-        capacity_factor=1.5, router_temperature=1.2,
-        router_mode="expected", w_importance=0.0, w_load=0.0,
+        num_experts=16,
+        num_features=32,
+        output_size=100,
+        top_k=2,
+        router_prior_var=10.0,
+        beta_kl=1e-6,
+        kl_anneal_steps=5000,
+        backbone_structure="resnet18",
+        backbone_pretrained=False,
+        hidden_size=64,
+        capacity_factor=1.5,
+        router_temperature=1.2,
+        router_mode="expected",
+        w_importance=0.0,
+        w_load=0.0,
+        use_amp=True,
+        amp_dtype=torch.bfloat16,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.02)
 
@@ -843,24 +984,40 @@ if __name__ == "__main__":
     # Warm-up for a few epochs
     for epoch in range(20):
         avg_loss, acc = model.train_one_epoch_warmup(
-            train_loader, optimizer, device, max_batches=MAX_BATCHES_QTEST
+            train_loader,
+            optimizer,
+            device,
+            max_batches=MAX_BATCHES_QTEST,
         )
         val_acc = model.evaluate_warmup(
-            test_loader, device, max_batches=MAX_BATCHES_QTEST
+            test_loader,
+            device,
+            max_batches=MAX_BATCHES_QTEST,
         )
         if (epoch + 1) % 10 == 0:
-            print(f"[warmup] epoch={epoch+1} "
-                  f"loss={avg_loss:.4f} train_acc={acc:.4f} val_acc={val_acc:.4f}")
+            print(
+                f"[warmup] epoch={epoch+1} "
+                f"loss={avg_loss:.4f} train_acc={acc:.4f} val_acc={val_acc:.4f}"
+            )
 
     # Then switch to full Bayesian training (expected path)
     for epoch in range(30):
         avg_loss, acc = model.train_one_epoch(
-            train_loader, optimizer, device, max_batches=MAX_BATCHES_QTEST
+            train_loader,
+            optimizer,
+            device,
+            max_batches=MAX_BATCHES_QTEST,
         )
-        test_acc = model.evaluate(test_loader, device, max_batches=MAX_BATCHES_QTEST)
+        test_acc = model.evaluate(
+            test_loader,
+            device,
+            max_batches=MAX_BATCHES_QTEST,
+        )
         if (epoch + 1) % 10 == 0:
-            print(f"[CIFAR-100][expected] epoch={epoch+1} "
-                  f"avg_loss={avg_loss:.4f} train_acc={acc:.4f} test_acc={test_acc:.4f}")
+            print(
+                f"[CIFAR-100][expected] epoch={epoch+1} "
+                f"avg_loss={avg_loss:.4f} train_acc={acc:.4f} test_acc={test_acc:.4f}"
+            )
 
     # CIFAR-10 expected path quick check
     with torch.no_grad():
@@ -873,10 +1030,19 @@ if __name__ == "__main__":
     )
     for epoch in range(3):
         avg_loss, acc = model.train_one_epoch(
-            train_loader, optimizer, device, max_batches=MAX_BATCHES_QTEST
+            train_loader,
+            optimizer,
+            device,
+            max_batches=MAX_BATCHES_QTEST,
         )
-        test_acc = model.evaluate(test_loader, device, max_batches=MAX_BATCHES_QTEST)
-        print(f"[CIFAR-10][expected] epoch={epoch+1} "
-              f"avg_loss={avg_loss:.4f} train_acc={acc:.4f} test_acc={test_acc:.4f}")
+        test_acc = model.evaluate(
+            test_loader,
+            device,
+            max_batches=MAX_BATCHES_QTEST,
+        )
+        print(
+            f"[CIFAR-10][expected] epoch={epoch+1} "
+            f"avg_loss={avg_loss:.4f} train_acc={acc:.4f} test_acc={test_acc:.4f}"
+        )
 
     print("Bayesian_NN_Moe basic unit test complete.")
