@@ -498,7 +498,7 @@ def default_base(output_size: int) -> Dict[str, Any]:
         batch_size=64,
         num_workers=4,
         epochs=40,
-        seeds=[0, 1],
+        seeds=[0],
 
         # model / backbone sizes
         backbone="resnet18",
