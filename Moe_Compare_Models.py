@@ -19,13 +19,26 @@ Metrics (intentionally minimal but MoE-aware):
   - routing CV (per_expert_counts), NMI(expert; label), overflow rate
   - ID / OOD max-softmax confidence stats (mean, std)
 
+Bayes-aware extra metrics (computed for all MoE models, but conceptually Bayes-friendly):
+  - H_E_norm  : normalized entropy of expert usage
+  - H_Y_norm  : normalized entropy of label distribution
+  - EAS       : entropy alignment score 1 - |H_E_norm - H_Y_norm|
+  - DARS      : Data-aware Routing Score = 0.5 * EAS + 0.5 * NMI
+
+Warm-up (Bayesian only):
+  - Optional warm-up epochs before main training.
+  - If model exposes train_one_epoch_warmup(...), use it.
+  - Otherwise: temporarily disable KL (beta_kl=0), set kl_anneal_steps=0,
+    and force router_mode='expected' during warm-up, then restore the
+    original settings.
+
 Results are written to a CSV file (moe_compare_results.csv).
 
 Usage examples:
-  # Compare all models on CIFAR-100, with SVHN as OOD
-  python Moe_Compare_Models.py --dataset cifar100 --models bayes,simple,ec,auxfree,base --ood svhn --epochs 40
+  # Compare all models on CIFAR-100, with SVHN as OOD, and 5 warm-up epochs for Bayes
+  python Moe_Compare_Models.py --dataset cifar100 --models bayes,simple,ec,auxfree,base --ood svhn --epochs 40 --bayes-warmup-epochs 5
 
-  # CIFAR-10 only, fewer epochs
+  # CIFAR-10 only, fewer epochs, no warm-up
   python Moe_Compare_Models.py --dataset cifar10 --models bayes,simple --ood svhn --epochs 20
 """
 
@@ -60,7 +73,7 @@ from Moe.BASE_Moe import BASE_Moe
 
 
 # ---------------------------------------------------------
-# Basic metrics: ECE, NMI, etc.
+# Basic metrics: ECE, NMI, entropy alignment
 # ---------------------------------------------------------
 
 @torch.no_grad()
@@ -120,6 +133,50 @@ def specialization_nmi(hard_assign: np.ndarray,
     return float(I / max(Hx, Hy))
 
 
+def _entropy(p: np.ndarray) -> float:
+    """
+    Helper: Shannon entropy with natural log.
+    Assumes p is a valid probability vector (sums to 1).
+    """
+    p = np.asarray(p, dtype=np.float64) + 1e-12
+    return float(-(p * np.log(p)).sum())
+
+
+def entropy_alignment_metrics(counts_np: np.ndarray,
+                              labels_np: np.ndarray,
+                              num_experts: int,
+                              num_classes: int) -> Tuple[float, float, float]:
+    """
+    Compute entropy-based alignment metrics between expert usage and data distribution.
+
+    Returns:
+        H_E_norm : normalized expert entropy H(E) / log(num_experts)
+        H_Y_norm : normalized label entropy H(Y) / log(num_classes)
+        EAS      : entropy alignment score = 1 - |H_E_norm - H_Y_norm|
+    """
+    # Edge cases: if no counts or no labels, return NaNs
+    if counts_np.sum() <= 0 or labels_np.size == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    # Expert usage distribution p(E)
+    p_e = counts_np.astype(np.float64) / counts_np.sum()
+    H_E = _entropy(p_e)
+    H_E_norm = H_E / max(math.log(num_experts + 1e-12), 1e-12)
+
+    # Label distribution p(Y)
+    label_counts = np.bincount(labels_np.astype(int), minlength=num_classes).astype(np.float64)
+    if label_counts.sum() <= 0:
+        return H_E_norm, float("nan"), float("nan")
+    p_y = label_counts / label_counts.sum()
+    H_Y = _entropy(p_y)
+    H_Y_norm = H_Y / max(math.log(num_classes + 1e-12), 1e-12)
+
+    # Entropy Alignment Score: 1 - |H_E_norm - H_Y_norm|, clipped to [0,1]
+    eas = 1.0 - abs(H_E_norm - H_Y_norm)
+    eas = float(max(0.0, min(1.0, eas)))
+    return H_E_norm, H_Y_norm, eas
+
+
 # ---------------------------------------------------------
 # Dataset builders (ID + OOD)
 # ---------------------------------------------------------
@@ -135,13 +192,13 @@ def build_id_loaders(dataset_name: str,
     dataset_name = dataset_name.lower()
     if dataset_name == "cifar10":
         train_loader, test_loader, _ = cifar10.get_dataloaders(
-            "1", batch_size=batch_size, num_workers=num_workers,
+            "2", batch_size=batch_size, num_workers=num_workers,
             data_dir="./data", download=download
         )
         num_classes = 10
     elif dataset_name == "cifar100":
         train_loader, test_loader, _ = cifar100.get_dataloaders(
-            "1", batch_size=batch_size, num_workers=num_workers,
+            "2", batch_size=batch_size, num_workers=num_workers,
             data_dir="./data", download=download
         )
         num_classes = 100
@@ -169,7 +226,7 @@ def build_ood_loader(name: str,
         )
     if name == "cifar100":
         return cifar100.get_dataloaders(
-            "1", batch_size=batch_size, num_workers=num_workers,
+            "2", batch_size=batch_size, num_workers=num_workers,
             data_dir="./data", download=download
         )[1]
     raise ValueError(f"Unsupported OOD dataset: {name}")
@@ -375,24 +432,127 @@ def build_model(model_name: str,
 
 
 # ---------------------------------------------------------
-# Training & evaluation loops
+# Training & evaluation loops (with Bayes warm-up)
 # ---------------------------------------------------------
+
+def _run_bayes_warmup(
+    model: nn.Module,
+    train_loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    warmup_epochs: int,
+) -> None:
+    """
+    Internal helper: run warm-up epochs for Bayesian_NN_Moe.
+
+    Priority:
+      1) If model has train_one_epoch_warmup(...), use that (preferred).
+      2) Otherwise, temporarily:
+           - set beta_kl = 0 (disable KL)
+           - set kl_anneal_steps = 0 (no annealing)
+           - set router_mode = 'expected' (deterministic expectation routing)
+         run standard train_one_epoch(...), then restore original values.
+    """
+    if warmup_epochs <= 0:
+        return
+
+    print(f"\n[Bayes] Warm-up: {warmup_epochs} epoch(s) before main training\n")
+
+    # Case 1: explicit warm-up method provided by the model
+    if hasattr(model, "train_one_epoch_warmup") and callable(getattr(model, "train_one_epoch_warmup")):
+        for ep in range(1, warmup_epochs + 1):
+            t0 = time.time()
+            avg_loss, train_acc = model.train_one_epoch_warmup(
+                loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                criterion=None,
+                max_batches=None,
+            )
+            t1 = time.time()
+            print(
+                f"  [Warmup explicit] Epoch {ep:03d}: "
+                f"train_loss={avg_loss:.4f} train_acc={train_acc:.4f} "
+                f"time={t1 - t0:.1f}s"
+            )
+        return
+
+    # Case 2: attribute-based warm-up (no special method)
+    # Backup original attributes
+    old_router_mode = getattr(model, "router_mode", None)
+    old_beta_kl = getattr(model, "beta_kl", None)
+    old_kl_anneal = getattr(model, "kl_anneal_steps", None)
+
+    # Apply warm-up settings
+    if hasattr(model, "beta_kl"):
+        model.beta_kl = 0.0
+    if hasattr(model, "kl_anneal_steps"):
+        model.kl_anneal_steps = 0
+    if hasattr(model, "router_mode"):
+        model.router_mode = "expected"
+
+    for ep in range(1, warmup_epochs + 1):
+        t0 = time.time()
+        avg_loss, train_acc = model.train_one_epoch(
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            criterion=None,
+            max_batches=None,
+        )
+        t1 = time.time()
+        print(
+            f"  [Warmup implicit] Epoch {ep:03d}: "
+            f"train_loss={avg_loss:.4f} train_acc={train_acc:.4f} "
+            f"time={t1 - t0:.1f}s"
+        )
+
+    # Restore original attributes
+    if old_router_mode is not None and hasattr(model, "router_mode"):
+        model.router_mode = old_router_mode
+    if old_beta_kl is not None and hasattr(model, "beta_kl"):
+        model.beta_kl = old_beta_kl
+    if old_kl_anneal is not None and hasattr(model, "kl_anneal_steps"):
+        model.kl_anneal_steps = old_kl_anneal
+
 
 def train_model(model: nn.Module,
                 train_loader: DataLoader,
                 device: torch.device,
                 epochs: int,
                 lr: float,
-                weight_decay: float) -> None:
+                weight_decay: float,
+                model_name: str,
+                bayes_warmup_epochs: int = 0) -> None:
     """
     Train a MoE model using its own train_one_epoch(...) method.
 
     All models share the signature:
         train_one_epoch(loader, optimizer, device, criterion=None, max_batches=None)
+
+    For Bayesian_NN_Moe (model_name == 'bayes'):
+      - If bayes_warmup_epochs > 0, run a warm-up phase before main training:
+          * Prefer model.train_one_epoch_warmup(...) if available.
+          * Otherwise, temporarily disable KL and force 'expected' router_mode.
+
+    Note: here `epochs` is treated as the TOTAL number of epochs,
+    and the main phase uses max(epochs - bayes_warmup_epochs, 1).
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    for ep in range(1, epochs + 1):
+    # Optional warm-up for Bayesian model
+    if model_name.lower() == "bayes" and bayes_warmup_epochs > 0:
+        _run_bayes_warmup(
+            model=model,
+            train_loader=train_loader,
+            device=device,
+            optimizer=optimizer,
+            warmup_epochs=bayes_warmup_epochs,
+        )
+
+    # Main training loop
+    main_epochs = max(epochs - bayes_warmup_epochs, 1)
+    for ep in range(1, main_epochs + 1):
         t0 = time.time()
         avg_loss, train_acc = model.train_one_epoch(
             loader=train_loader,
@@ -403,7 +563,7 @@ def train_model(model: nn.Module,
         )
         t1 = time.time()
         print(
-            f"  Epoch {ep:03d}: train_loss={avg_loss:.4f} "
+            f"  [Main] Epoch {ep:03d}: train_loss={avg_loss:.4f} "
             f"train_acc={train_acc:.4f}  time={t1 - t0:.1f}s"
         )
 
@@ -412,13 +572,18 @@ def train_model(model: nn.Module,
 def evaluate_moe(model: nn.Module,
                  test_loader: DataLoader,
                  device: torch.device,
-                 num_experts: int) -> Dict[str, Any]:
+                 num_experts: int,
+                 num_classes: int) -> Dict[str, Any]:
     """
     Evaluate a MoE model on ID test set, computing:
       - accuracy, NLL, ECE
       - routing CV, NMI(expert; label), overflow rate, routing entropy
+      - H_E_norm, H_Y_norm, EAS (entropy alignment)
+      - DARS = 0.5 * EAS + 0.5 * NMI (data-aware routing score)
 
     We use model(x, return_aux=True) to gather routing statistics.
+    This works for all MoE variants as long as they expose per_expert_counts,
+    overflow_dropped, routing_entropy and topk_idx in aux.
     """
     model.eval()
 
@@ -470,6 +635,10 @@ def evaluate_moe(model: nn.Module,
             "nmi": float("nan"),
             "overflow": float("nan"),
             "routing_entropy": float("nan"),
+            "H_E_norm": float("nan"),
+            "H_Y_norm": float("nan"),
+            "EAS": float("nan"),
+            "DARS": float("nan"),
         }
 
     logits = torch.cat(logits_all, dim=0)
@@ -501,7 +670,24 @@ def evaluate_moe(model: nn.Module,
         lb = np.concatenate(label_list, axis=0)
         nmi = specialization_nmi(ha, lb, num_experts)
     else:
+        ha = np.array([], dtype=int)
+        lb = np.array([], dtype=int)
         nmi = float("nan")
+
+    # entropy alignment metrics between expert usage and label distribution
+    H_E_norm, H_Y_norm, EAS = entropy_alignment_metrics(
+        counts_np=counts_np,
+        labels_np=labels.numpy(),
+        num_experts=num_experts,
+        num_classes=num_classes,
+    )
+
+    # Data-aware Routing Score: simple blend of entropy alignment and specialization
+    # lambda = 0.5 -> equal weight on EAS and NMI
+    if not (math.isnan(EAS) or math.isnan(nmi)):
+        DARS = 0.5 * EAS + 0.5 * nmi
+    else:
+        DARS = float("nan")
 
     return dict(
         acc=float(acc),
@@ -511,6 +697,10 @@ def evaluate_moe(model: nn.Module,
         nmi=nmi,
         overflow=overflow_rate,
         routing_entropy=routing_entropy,
+        H_E_norm=H_E_norm,
+        H_Y_norm=H_Y_norm,
+        EAS=EAS,
+        DARS=DARS,
     )
 
 
@@ -562,7 +752,11 @@ def parse_args():
                     help="Comma-separated list of models: bayes,simple,ec,auxfree,base")
     ap.add_argument("--ood", type=str, default="svhn",
                     help="OOD dataset name (svhn,stl10,cifar10,cifar100). Empty string to disable OOD.")
-    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--epochs", type=int, default=40,
+                    help="Total training epochs (warm-up + main).")
+    ap.add_argument("--bayes-warmup-epochs", type=int, default=0,
+                    help="Number of warm-up epochs for Bayesian_NN_Moe before main training. "
+                         "Ignored for non-Bayes models.")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--lr", type=float, default=5e-4)
@@ -619,7 +813,7 @@ def main():
         # build model
         model = build_model(mname, num_classes, device, best_cfg)
 
-        # train
+        # train (with optional Bayes warm-up)
         train_model(
             model=model,
             train_loader=train_loader,
@@ -627,6 +821,8 @@ def main():
             epochs=args.epochs,
             lr=args.lr,
             weight_decay=args.weight_decay,
+            model_name=mname,
+            bayes_warmup_epochs=args.bayes_warmup_epochs,
         )
 
         # evaluate on ID
@@ -634,7 +830,8 @@ def main():
             model=model,
             test_loader=test_loader,
             device=device,
-            num_experts=16,  # fixed in all our configurations
+            num_experts=16,        # fixed in all our configurations
+            num_classes=num_classes,
         )
 
         # confidence stats (ID)
@@ -662,6 +859,7 @@ def main():
             dataset=args.dataset,
             model=mname,
             epochs=args.epochs,
+            bayes_warmup_epochs=(args.bayes_warmup_epochs if mname == "bayes" else 0),
             batch_size=args.batch_size,
             lr=args.lr,
             weight_decay=args.weight_decay,
@@ -673,6 +871,10 @@ def main():
             nmi=ev["nmi"],
             overflow=ev["overflow"],
             routing_entropy=ev["routing_entropy"],
+            H_E_norm=ev["H_E_norm"],
+            H_Y_norm=ev["H_Y_norm"],
+            EAS=ev["EAS"],
+            DARS=ev["DARS"],
             id_mean_conf=id_stats["mean_conf"],
             id_std_conf=id_stats["std_conf"],
             id_n=id_stats["n"],
@@ -688,6 +890,8 @@ def main():
             f"[{args.dataset}][{mname}] acc={row['test_acc']:.4f} "
             f"nll={row['test_nll']:.3f} ece={row['ece']:.4f} "
             f"cv={row['cv']:.3f} nmi={row['nmi']:.3f} overflow={row['overflow']:.4f} "
+            f"H_E_norm={row['H_E_norm']:.3f} H_Y_norm={row['H_Y_norm']:.3f} "
+            f"EAS={row['EAS']:.3f} DARS={row['DARS']:.3f} "
             f"id_mean_conf={row['id_mean_conf']:.4f} "
             f"ood_mean_conf={row['ood_mean_conf']:.4f}"
         )
@@ -699,8 +903,10 @@ def main():
 
     # quick text summary
     cols = [
-        "dataset", "model", "test_acc", "test_nll", "ece",
+        "dataset", "model", "bayes_warmup_epochs",
+        "test_acc", "test_nll", "ece",
         "cv", "nmi", "overflow",
+        "H_E_norm", "H_Y_norm", "EAS", "DARS",
         "id_mean_conf", "ood_mean_conf",
     ]
     print(df[cols].to_string(index=False))

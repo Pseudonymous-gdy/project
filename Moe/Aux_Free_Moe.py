@@ -184,9 +184,19 @@ class Aux_Free_Moe(nn.Module):
         features = self.Back_bone(x)                             # [B, F]
 
         # 2) Scores (gating + noise + expert bias)
-        raw_scores = self.gate_linear(features)                  # [B, E]
+        # Align feature dtype with gate parameters for AMP safety
+        f_gate = features
+        p_dtype = self.gate_linear.weight.dtype
+        if f_gate.dtype != p_dtype:
+            f_gate = f_gate.to(p_dtype)
+        raw_scores = self.gate_linear(f_gate)                    # [B, E]
         if self.per_token_noise:
-            sigma = F.softplus(self.noise_linear(features)) + self.min_noise_scale
+            # Align dtype for noise linear as well
+            f_noise = features
+            p_dtype_n = self.noise_linear.weight.dtype
+            if f_noise.dtype != p_dtype_n:
+                f_noise = f_noise.to(p_dtype_n)
+            sigma = F.softplus(self.noise_linear(f_noise)) + self.min_noise_scale
             scores = raw_scores + sigma * torch.randn_like(raw_scores)
         else:
             scores = raw_scores
@@ -224,11 +234,20 @@ class Aux_Free_Moe(nn.Module):
                 Be = capacity
 
             f_e = features[token_idx]
+            # Align expert input dtype with its parameters
+            p_dtype_e = next(self.experts[e].parameters()).dtype
+            if f_e.dtype != p_dtype_e:
+                f_e = f_e.to(p_dtype_e)
             y_e = self.experts[e](f_e)                           # [Be, C]
 
             w = (topk_idx[token_idx] == e).float()               # [Be, k]
             w = (topk_w[token_idx] * w).sum(dim=1, keepdim=True) # [Be, 1]
 
+            # Align accumulation dtype with combined for AMP safety
+            if y_e.dtype != combined.dtype:
+                y_e = y_e.to(combined.dtype)
+            if w.dtype != combined.dtype:
+                w = w.to(combined.dtype)
             combined.index_add_(0, token_idx, w * y_e)
             per_expert_counts[e] += Be
 

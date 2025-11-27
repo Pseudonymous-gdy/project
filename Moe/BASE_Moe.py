@@ -188,7 +188,8 @@ class BASE_Moe(nn.Module):
         scores_exp = torch.cat(exp_cols, dim=1)  # [B, B]
 
         # Hungarian solves a minimum cost problem; we want maximum score.
-        cost = (-scores_exp).detach().cpu().numpy()
+        # SciPy does not support bf16/half; cast to float32 before numpy
+        cost = (-scores_exp).detach().to(torch.float32).cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost)
 
         # Map expanded columns back to expert ids and return on the original device
@@ -273,9 +274,19 @@ class BASE_Moe(nn.Module):
         features = self.Back_bone(x)                       # [B, F]
 
         # 2) Routing scores
-        raw_scores = self.gate_linear(features)            # [B, E]
+        # Align features dtype with gate parameters for AMP safety
+        f_gate = features
+        p_dtype = self.gate_linear.weight.dtype
+        if f_gate.dtype != p_dtype:
+            f_gate = f_gate.to(p_dtype)
+        raw_scores = self.gate_linear(f_gate)            # [B, E]
         if self.use_noisy_scores:
-            sigma = F.softplus(self.noise_linear(features)) + self.min_noise_scale
+            # Align dtype for noise linear as well
+            f_noise = features
+            p_dtype_n = self.noise_linear.weight.dtype
+            if f_noise.dtype != p_dtype_n:
+                f_noise = f_noise.to(p_dtype_n)
+            sigma = F.softplus(self.noise_linear(f_noise)) + self.min_noise_scale
             scores = raw_scores + sigma * torch.randn_like(raw_scores)
         else:
             scores = raw_scores
@@ -299,8 +310,14 @@ class BASE_Moe(nn.Module):
             token_idx = torch.nonzero(assigned_e == e, as_tuple=False).view(-1)  # [Be]
             if token_idx.numel() == 0:
                 continue
-            y_e = self.experts[e](features[token_idx])                           # [Be, C]
+            f_e = features[token_idx]
+            p_dtype_e = next(self.experts[e].parameters()).dtype
+            if f_e.dtype != p_dtype_e:
+                f_e = f_e.to(p_dtype_e)
+            y_e = self.experts[e](f_e)                           # [Be, C]
             # Accumulate with index_add_ (faster than 'combined[token_idx] += ...')
+            if y_e.dtype != combined.dtype:
+                y_e = y_e.to(combined.dtype)
             combined.index_add_(0, token_idx, y_e)
             per_expert_counts[e] = token_idx.numel()
 

@@ -194,12 +194,12 @@ def get_loaders(dataset: str = "cifar100",
     """
     if dataset.lower() == "cifar10":
         train, test, _ = cifar10.get_dataloaders(
-            batch_size=bs, num_workers=num_workers,
+            setting='2', batch_size=bs, num_workers=num_workers,
             data_dir=data_dir, download=False
         )
     else:
         train, test, _ = cifar100.get_dataloaders(
-            batch_size=bs, num_workers=num_workers,
+            setting='2', batch_size=bs, num_workers=num_workers,
             data_dir=data_dir, download=False
         )
     return train, test
@@ -590,11 +590,11 @@ def sweep_list() -> List[Dict[str, Any]]:
 
         # 13. Warm-up only (expected router) before Bayesian training
         {"name": "warmup_expected",
-         "use_warmup": True, "warmup_epochs": 5, "router_mode": "expected"},
+         "use_warmup": True, "warmup_epochs": 10, "router_mode": "expected"},
 
         # 14. Warm-up + MC-ELBO router
         {"name": "warmup_mc_elbo",
-         "use_warmup": True, "warmup_epochs": 5,
+         "use_warmup": True, "warmup_epochs": 10,
          "router_mode": "mc", "elbo_samples": 4, "use_control_variate": True},
     ]
 
@@ -807,7 +807,8 @@ def run(args: argparse.Namespace):
             print(f"[sweep={i} '{sweep_name}' seed={seed}] "
                   f"Main training for {cfg['epochs']} epochs...", flush=True)
 
-            for ep in range(cfg["epochs"]):
+            EPOCHS = max(cfg["epochs"] - warmup_epochs, 1)
+            for ep in range(EPOCHS):
                 if use_cuda:
                     torch.cuda.synchronize()
                 t0 = time.time()
@@ -829,7 +830,7 @@ def run(args: argparse.Namespace):
                 per_epoch_ips.append(ips)
 
                 print(
-                    f"  [train ep={ep+1}/{cfg['epochs']}] "
+                    f"  [train ep={ep+1}/{EPOCHS}] "
                     f"loss={avg_loss:.4f} acc={tr_acc:.4f} ips={ips:.1f}",
                     flush=True,
                 )
