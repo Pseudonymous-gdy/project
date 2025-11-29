@@ -22,3 +22,34 @@ This file is used to test the training time and accuracy of different
 Mixture of Experts (MoE) models on CIFAR-10 and CIFAR-100 datasets.
 Set the arguments to test different models.
 '''
+
+def main():
+    train_loader, test_loader, classes = cifar100.get_dataloaders(batch_size=64)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Derive number of classes from the dataloader metadata
+    num_classes = len(classes) if hasattr(classes, "__len__") else int(classes)
+
+    models = [
+        Simple_Moe(output_size=num_classes).to(device),
+        Aux_Free_Moe(output_size=num_classes).to(device),
+        BASE_Moe(output_size=num_classes).to(device),
+        Bayesian_NN_Moe(output_size=num_classes).to(device),
+        Expert_Choice(output_size=num_classes).to(device),
+    ]
+
+    for model in models:
+        print(model.__class__.__name__)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        for i in range(100):
+            model.train_one_epoch(train_loader, optimizer, device)
+            if i % 10 == 0:
+                output = model.evaluate(train_loader, device)
+                print('\rModel Accuracy:', output, end='')
+        print()
+        print(model.evaluate(test_loader, device))
+
+if __name__ == '__main__':
+    import multiprocessing as mp
+    mp.freeze_support()
+    main()
