@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, Subset
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # Project-local modules (keep layout consistent with your repo)
 import cifar10
@@ -331,7 +331,7 @@ class Simple_Moe(nn.Module):
             optimizer.zero_grad(set_to_none=True)
 
             # Single forward pass with aux routing stats, under autocast if AMP is enabled.
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs, aux = self.forward(inputs, return_aux=True)
 
                 # Task loss

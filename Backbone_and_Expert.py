@@ -22,9 +22,15 @@ class Backbone(nn.Module):
         '''
         super(Backbone, self).__init__()
         if structure == 'resnet18':
-            self.backbone = torchvision.models.resnet18(pretrained=pretrained)
+            weights = (
+                torchvision.models.ResNet18_Weights.DEFAULT if pretrained else None
+            )
+            self.backbone = torchvision.models.resnet18(weights=weights)
         elif structure == 'resnet34':
-            self.backbone = torchvision.models.resnet34(pretrained=pretrained)
+            weights = (
+                torchvision.models.ResNet34_Weights.DEFAULT if pretrained else None
+            )
+            self.backbone = torchvision.models.resnet34(weights=weights)
         else:
             raise ValueError("Unsupported backbone structure")
 

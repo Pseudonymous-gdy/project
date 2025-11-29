@@ -24,7 +24,7 @@ Set the arguments to test different models.
 '''
 
 def main():
-    train_loader, test_loader, classes = cifar100.get_dataloaders(batch_size=64)
+    train_loader, test_loader, classes = cifar100.get_dataloaders(setting='2', batch_size=64)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Derive number of classes from the dataloader metadata
@@ -40,12 +40,13 @@ def main():
 
     for model in models:
         print(model.__class__.__name__)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-        for i in range(100):
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+        for i in range(40):
             model.train_one_epoch(train_loader, optimizer, device)
             if i % 10 == 0:
                 output = model.evaluate(train_loader, device)
-                print('\rModel Accuracy:', output, end='')
+                print('Using Device:', device)
+                print('Model Accuracy:', output)
         print()
         print(model.evaluate(test_loader, device))
 

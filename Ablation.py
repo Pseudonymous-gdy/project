@@ -3,10 +3,10 @@ Ablation runner for Bayesian_NN_Moe (Bayesian router + sparse Top-k).
 
 What this script does
 ---------------------
-1) Runs a focused sweep over:
-     - router training mode: 'expected' vs 'mc' (ELBO)
-     - KL weight beta_kl and annealing
-     - warm-up vs no warm-up (BASE-style / Bayesian-top-k style pretraining)
+1) Runs a structured sweep over:
+     - router training mode: 'expected' vs 'mc' (MC-ELBO)
+     - KL weight beta_kl
+     - optional warm-up: BASE-style / Bayesian-top-k-style pretraining
 2) Trains via the model's own train_one_epoch(...) (which already implements
    ELBO, KL annealing and optional aux balance losses).
 3) Optionally runs a warm-up phase via train_one_epoch_warmup(...) if the
@@ -24,22 +24,23 @@ What this script does
      - Several scatter/line plots:
           * Acc vs CV (balance vs performance)
           * Acc vs NMI_topk_soft (data-structure alignment vs performance)
-          * ECE vs beta_kl (per router_mode + warmup)
+          * ECE vs beta_kl (per router_mode & warm-up)
           * Overflow vs capacity_factor
           * Img/s vs CV (efficiency vs balance)
-          * NMI_topk_soft vs beta_kl (per router_mode + warmup)
+          * NMI_topk_soft vs beta_kl (per router_mode & warm-up)
 
 Design philosophy
 -----------------
-- The goal is to isolate the effect of:
-    * introducing ELBO (router_mode='mc') vs expectation mode,
-    * and introducing warm-up (with different KL weights),
-  under fixed routing hyperparameters (top_k, tau, capacity, etc.).
-- We keep:
+- The goal is NOT to force perfectly balanced expert loads, but to see how
+  different KL / ELBO / warm-up configurations trade off:
     * predictive performance (acc, NLL, ECE),
     * load balance (CV/Gini/overflow),
-    * and structural specialization (NMI_topk_soft)
-  as the main axes for analysis.
+    * and structural specialization (NMI_topk_soft) between experts and data.
+- ELBO-related knobs (router_mode='mc', beta_kl, etc.) and warm-up are treated
+  as levers to improve:
+    * training stability / efficiency,
+    * calibration,
+    * and the alignment between expert routing patterns and label structure.
 """
 
 import os
@@ -487,7 +488,7 @@ def default_base(output_size: int) -> Dict[str, Any]:
     Reasonable starting point for Bayesian_NN_Moe on CIFAR-10/100.
 
     This base config can be overridden by:
-      - CLI arguments (dataset, epochs, batch size, num_workers)
+      - CLI arguments (dataset, epochs, batch size, seeds, ...)
       - sweep_list() deltas (router_mode, beta_kl, warmup_epochs, etc.)
     """
     return dict(
@@ -496,7 +497,7 @@ def default_base(output_size: int) -> Dict[str, Any]:
         batch_size=64,
         num_workers=4,
         epochs=40,
-        seeds=[0],                     # single fixed seed
+        seeds=[0, 1, 2, 3, 4],   # default 5 seeds: 0-4
 
         # model / backbone sizes
         backbone="resnet18",
@@ -506,23 +507,23 @@ def default_base(output_size: int) -> Dict[str, Any]:
 
         # routing & Bayesian regularization
         top_k=2,
-        tau=1.2,                       # router temperature
-        capacity=1.0,                  # capacity_factor
-        router_mode="expected",        # 'expected' or 'mc'
-        elbo_samples=2,                # used when router_mode=='mc'
+        tau=1.2,                     # router temperature
+        capacity=1.0,                # capacity_factor
+        router_mode="expected",      # 'expected' or 'mc'
+        elbo_samples=2,              # used when router_mode=='mc'
         use_control_variate=True,
         prior_var=10.0,
         beta_kl=1e-6,
         kl_anneal=5000,
 
         # optimizer & optional aux balances
-        weight_decay=0.02,
+        weight_decay=0.001,
         w_importance=0.0,
         w_load=0.0,
 
         # warm-up configuration
         use_warmup=False,
-        warmup_epochs=0,
+        warmup_epochs=0,             # set >0 in sweeps to enable warm-up
 
         # outputs
         output_size=output_size,
@@ -531,81 +532,64 @@ def default_base(output_size: int) -> Dict[str, Any]:
 
 def sweep_list() -> List[Dict[str, Any]]:
     """
-    KL / ELBO ablation + warm-up ablation.
+    KL-only + warm-up ablation sweep.
 
     Design:
-      - 5 KL weights: beta_kl in {0, 5e-7, 1e-6, 5e-6, 1e-5}
-      - 2 router modes: 'expected' vs 'mc'
-      - For each (mode, beta_kl):
-          * one run without warm-up
-          * one run with 10 epochs of warm-up
-
-    Total: 5 * 2 * 2 = 20 sweep configs.
+      - 5 values of beta_kl: [0, 1e-7, 1e-6, 1e-5, 1e-4]
+      - 2 router modes: 'expected' and 'mc'
+      - For each (mode, beta_kl), we run:
+          * one config WITHOUT warm-up
+          * one config WITH warm-up (fixed warmup_epochs)
+      => 5 * 2 * 2 = 20 sweep variants.
     """
+    betas = [0.0, 1e-7, 1e-6, 1e-5, 1e-4]
+    warmup_epochs_default = 10
 
-    betas = [0.0, 5e-7, 1e-6, 5e-6, 1e-5]
     sweeps: List[Dict[str, Any]] = []
 
-    def beta_tag(beta: float) -> str:
-        """Nice string for beta in sweep names."""
-        if beta == 0.0:
-            return "0"
-        # e.g. 1e-06 -> "1e-6"
-        return f"{beta:.0e}".replace("+0", "").replace("+", "")
-
-    # ---- (A) No warm-up: pure ELBO / KL effect ----
+    # 10 sweeps: KL ablation without warm-up
     for beta in betas:
-        tag = beta_tag(beta)
+        # expected router, no warm-up
+        sweeps.append({
+            "name": f"kl_exp_no_warmup_beta_{beta:g}",
+            "router_mode": "expected",
+            "beta_kl": beta,
+            "use_warmup": False,
+            "warmup_epochs": 0,
+        })
 
-        # expected-mode router (deterministic logistic-normal expectation)
-        sweeps.append(
-            {
-                "name": f"expected_beta{tag}_nowarm",
-                "router_mode": "expected",
-                "beta_kl": beta,
-                "use_warmup": False,
-                "warmup_epochs": 0,
-            }
-        )
+        # mc-ELBO router, no warm-up
+        sweeps.append({
+            "name": f"kl_mc_no_warmup_beta_{beta:g}",
+            "router_mode": "mc",
+            "beta_kl": beta,
+            "elbo_samples": 4,
+            "use_control_variate": True,
+            "use_warmup": False,
+            "warmup_epochs": 0,
+        })
 
-        # mc-mode router (stochastic ELBO)
-        sweeps.append(
-            {
-                "name": f"mc_beta{tag}_nowarm",
-                "router_mode": "mc",
-                "elbo_samples": 4,
-                "use_control_variate": True,
-                "beta_kl": beta,
-                "use_warmup": False,
-                "warmup_epochs": 0,
-            }
-        )
-
-    # ---- (B) With warm-up: same grid but with 10 warm-up epochs ----
+    # 10 sweeps: same KL grid but with warm-up
     for beta in betas:
-        tag = beta_tag(beta)
+        # expected router + warm-up
+        sweeps.append({
+            "name": f"kl_exp_warmup_beta_{beta:g}",
+            "router_mode": "expected",
+            "beta_kl": beta,
+            "use_warmup": True,
+            "warmup_epochs": warmup_epochs_default,
+        })
 
-        sweeps.append(
-            {
-                "name": f"expected_beta{tag}_warm10",
-                "router_mode": "expected",
-                "beta_kl": beta,
-                "use_warmup": True,
-                "warmup_epochs": 10,
-            }
-        )
-
-        sweeps.append(
-            {
-                "name": f"mc_beta{tag}_warm10",
-                "router_mode": "mc",
-                "elbo_samples": 4,
-                "use_control_variate": True,
-                "beta_kl": beta,
-                "use_warmup": True,
-                "warmup_epochs": 10,
-            }
-        )
+        # mc-ELBO router + warm-up
+        sweeps.append({
+            "name": f"kl_mc_warmup_beta_{beta:g}",
+            "router_mode": "mc",
+            "beta_kl": beta,
+            "elbo_samples": 4,
+            "use_control_variate": True,
+            "use_warmup": True,
+            "warmup_epochs": warmup_epochs_default,
+        })
 
     return sweeps
 
@@ -629,6 +613,8 @@ def plot_scatter(df: pd.DataFrame,
         fname : output filename (e.g., 'plot_acc_vs_cv.png').
         xlabel, ylabel: axis labels (if None, use column names).
     """
+    if df.empty:
+        return
     plt.figure()
     plt.scatter(df[x], df[y], s=24)
     plt.xlabel(xlabel or x)
@@ -660,6 +646,9 @@ def plot_line(df: pd.DataFrame,
         fname: output filename.
         xlabel, ylabel: axis labels.
     """
+    if df.empty:
+        return
+
     plt.figure()
     if group is None:
         df_sorted = df.sort_values(by=x)
@@ -688,7 +677,7 @@ def run(args: argparse.Namespace):
     Steps:
       1) Build data loaders for CIFAR-10/100.
       2) Construct a base config, override with CLI args.
-      3) For each sweep delta and the single random seed:
+      3) For each sweep delta and each random seed:
             a) Build a model and optimizer.
             b) Optionally run warm-up (if use_warmup & model exposes warm-up).
             c) Train for cfg['epochs'] epochs via train_one_epoch(...).
@@ -699,10 +688,11 @@ def run(args: argparse.Namespace):
       5) Save CSVs, JSON, and generate several diagnostic plots.
     """
     # ---------------- Device and GPU usage ----------------
+    cuda_available = torch.cuda.is_available()
     # We decide whether to use CUDA based on:
     #   - torch.cuda.is_available()
     #   - args.num_gpus: if 0, force CPU even if CUDA is available.
-    use_cuda = torch.cuda.is_available() and (args.num_gpus > 0)
+    use_cuda = cuda_available and (args.num_gpus > 0)
     device = "cuda" if use_cuda else "cpu"
 
     # world_size controls how we partition the sweep_list across processes.
@@ -711,9 +701,9 @@ def run(args: argparse.Namespace):
     world_size = args.num_gpus if args.num_gpus > 0 else 1
 
     print(
-        f"[INFO] device={device}, "
-        f"num_gpus_arg={args.num_gpus}, world_size={world_size}, "
-        f"sweep_offset={args.sweep_offset}",
+        f"[INFO] torch.cuda.is_available()={cuda_available}, "
+        f"args.num_gpus={args.num_gpus}, use_cuda={use_cuda}, device='{device}', "
+        f"world_size={world_size}, sweep_offset={args.sweep_offset}",
         flush=True,
     )
 
@@ -739,6 +729,8 @@ def run(args: argparse.Namespace):
     base["batch_size"] = args.bs
     base["num_workers"] = args.workers
     base["epochs"] = args.epochs
+    # Seeds: by default 0–4, can be overridden by CLI
+    base["seeds"] = [int(s) for s in args.seeds.split(",")]
     base["output_size"] = output_size
 
     sweeps = sweep_list()
@@ -766,6 +758,14 @@ def run(args: argparse.Namespace):
             torch.manual_seed(seed)
             np.random.seed(seed)
             random.seed(seed)
+
+            print(
+                f"[INFO] Starting sweep_id={i}, name='{sweep_name}', seed={seed}, "
+                f"router_mode={cfg['router_mode']}, beta_kl={cfg['beta_kl']}, "
+                f"use_warmup={cfg.get('use_warmup', False)}, "
+                f"warmup_epochs={cfg.get('warmup_epochs', 0)}",
+                flush=True,
+            )
 
             # 3.b Build model & optimizer
             model = build_model(cfg, output_size, device)
@@ -815,7 +815,8 @@ def run(args: argparse.Namespace):
 
             # 3.d Main training loop (Bayesian / ELBO phase)
             print(f"[sweep={i} '{sweep_name}' seed={seed}] "
-                  f"Main training for {cfg['epochs']} epochs...", flush=True)
+                  f"Main training for {cfg['epochs']} epochs (total, incl. warm-up)...",
+                  flush=True)
 
             EPOCHS = max(cfg["epochs"] - warmup_epochs, 1)
             for ep in range(EPOCHS):
@@ -904,13 +905,6 @@ def run(args: argparse.Namespace):
     df = pd.DataFrame(results)
     df.to_csv("ablation_results_raw.csv", index=False)
 
-    # Tag combinations of router mode and warm-up state for plotting
-    if "router_mode" in df.columns and "use_warmup" in df.columns:
-        df["mode_warmup"] = (
-            df["router_mode"].astype(str)
-            + np.where(df["use_warmup"], "+warm", "+nowarm")
-        )
-
     # Normalize img/s for scoring
     if df["img_s"].notna().any():
         mn, mx = df["img_s"].min(), df["img_s"].max()
@@ -946,7 +940,7 @@ def run(args: argparse.Namespace):
     # -----------------------------------------------------
 
     # (1) Accuracy vs CV (balance vs performance)
-    if "cv" in df.columns:
+    if "cv" in df.columns and "acc" in df.columns:
         plot_scatter(
             df.dropna(subset=["cv", "acc"]),
             x="cv",
@@ -957,7 +951,7 @@ def run(args: argparse.Namespace):
         )
 
     # (2) Accuracy vs NMI_topk_soft (specialization vs performance)
-    if "nmi_topk_soft" in df.columns:
+    if "nmi_topk_soft" in df.columns and "acc" in df.columns:
         plot_scatter(
             df.dropna(subset=["nmi_topk_soft", "acc"]),
             x="nmi_topk_soft",
@@ -967,22 +961,31 @@ def run(args: argparse.Namespace):
             ylabel="Accuracy",
         )
 
-    # (3) ECE vs beta_kl (one line per router_mode + warm-up state)
-    if "beta_kl" in df.columns and "mode_warmup" in df.columns:
-        plot_line(
-            df,
-            x="beta_kl",
-            y="ece",
-            group="mode_warmup",
-            fname="plot_ece_vs_beta.png",
-            xlabel="beta_kl (router KL weight)",
-            ylabel="ECE",
-        )
+    # (3) ECE vs beta_kl (grouped by router_mode + warmup)
+    if {"beta_kl", "router_mode", "use_warmup", "ece"}.issubset(df.columns):
+        df_beta = df.dropna(subset=["beta_kl", "ece"])
+        if not df_beta.empty:
+            agg = df_beta.groupby(
+                ["router_mode", "use_warmup", "beta_kl"], as_index=False
+            ).mean(numeric_only=True)
+            agg["mode_warmup"] = agg.apply(
+                lambda r: f"{r['router_mode']}_{'warmup' if r['use_warmup'] else 'no_warmup'}",
+                axis=1,
+            )
+            plot_line(
+                agg,
+                x="beta_kl",
+                y="ece",
+                group="mode_warmup",
+                fname="plot_ece_vs_beta.png",
+                xlabel="beta_kl (router KL weight)",
+                ylabel="ECE",
+            )
 
-    # (4) Overflow vs capacity_factor
+    # (4) Overflow vs capacity_factor (here capacity is fixed, but kept for completeness)
     if "capacity" in df.columns and "overflow" in df.columns:
         plot_line(
-            df,
+            df.dropna(subset=["capacity", "overflow"]),
             x="capacity",
             y="overflow",
             group=None,
@@ -1002,17 +1005,26 @@ def run(args: argparse.Namespace):
             ylabel="Images/sec (throughput)",
         )
 
-    # (6) NMI_topk_soft vs beta_kl (one line per router_mode + warm-up state)
-    if "nmi_topk_soft" in df.columns and "beta_kl" in df.columns and "mode_warmup" in df.columns:
-        plot_line(
-            df.dropna(subset=["nmi_topk_soft", "beta_kl"]),
-            x="beta_kl",
-            y="nmi_topk_soft",
-            group="mode_warmup",
-            fname="plot_nmi_soft_vs_beta.png",
-            xlabel="beta_kl (router KL weight)",
-            ylabel="NMI_topk_soft",
-        )
+    # (6) NMI_topk_soft vs beta_kl (grouped by router_mode + warmup)
+    if {"beta_kl", "router_mode", "use_warmup", "nmi_topk_soft"}.issubset(df.columns):
+        df_nmi = df.dropna(subset=["beta_kl", "nmi_topk_soft"])
+        if not df_nmi.empty:
+            agg_nmi = df_nmi.groupby(
+                ["router_mode", "use_warmup", "beta_kl"], as_index=False
+            ).mean(numeric_only=True)
+            agg_nmi["mode_warmup"] = agg_nmi.apply(
+                lambda r: f"{r['router_mode']}_{'warmup' if r['use_warmup'] else 'no_warmup'}",
+                axis=1,
+            )
+            plot_line(
+                agg_nmi,
+                x="beta_kl",
+                y="nmi_topk_soft",
+                group="mode_warmup",
+                fname="plot_nmi_soft_vs_beta.png",
+                xlabel="beta_kl (router KL weight)",
+                ylabel="NMI_topk_soft",
+            )
 
     print("\nSaved files:")
     print("  - ablation_results_raw.csv")
@@ -1049,7 +1061,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bs",
         type=int,
-        default=128,
+        default=64,
         help="Batch size.",
     )
     parser.add_argument(
@@ -1061,12 +1073,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs",
         type=int,
-        default=1,
-        help="Number of main training epochs per sweep variant "
-             "(warm-up epochs are configured inside sweep_list).",
+        default=50,
+        help="Total number of epochs per sweep variant "
+             "(warm-up epochs are configured inside sweep_list and are "
+             "subtracted from this total for the main Bayesian training).",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default="0",
+        help="Comma-separated seeds, e.g. '0,1,2,3,4'.",
     )
 
-    # ---------- CLI arguments for GPU / sweep parallelism ----------
+    # ---------- New CLI arguments for GPU / sweep parallelism ----------
     # num_gpus:
     #   - default is 1 if CUDA is available, otherwise 0.
     #   - interpreted as the total number of GPUs (i.e., concurrent processes)
@@ -1094,7 +1113,7 @@ if __name__ == "__main__":
         default=0,
         help=(
             "Index of this process in [0, num_gpus-1] for partitioning the "
-            "sweep_list. Only sweeps with index % num_gpus == sweep_offset "
+            "sweep_list. Only sweeps with index %% num_gpus == sweep_offset "
             "are executed by this process."
         ),
     )

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # project-local
 import cifar10
@@ -340,7 +340,7 @@ class Aux_Free_Moe(nn.Module):
             optimizer.zero_grad(set_to_none=True)
 
             # Forward + loss inside autocast when AMP is enabled.
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs, aux = self.forward(inputs, return_aux=True)
                 loss = criterion(outputs, targets)
 

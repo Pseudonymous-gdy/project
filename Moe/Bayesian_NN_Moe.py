@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as Fnn  # avoid name clash with local variables
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # project-local
 import cifar10
@@ -500,7 +500,7 @@ class Bayesian_NN_Moe(nn.Module):
             optimizer.zero_grad(set_to_none=True)
 
             # Forward + loss inside autocast when AMP is enabled.
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                 # 1) Features once
                 h = self.Back_bone(inputs)
 
@@ -860,7 +860,7 @@ class Bayesian_NN_Moe(nn.Module):
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs, _aux = self.forward_warmup(inputs, return_aux=True)
                 loss = criterion(outputs, targets)
 
