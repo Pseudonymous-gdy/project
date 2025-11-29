@@ -3,11 +3,10 @@ Ablation runner for Bayesian_NN_Moe (Bayesian router + sparse Top-k).
 
 What this script does
 ---------------------
-1) Runs a compact, structured sweep over:
+1) Runs a focused sweep over:
      - router training mode: 'expected' vs 'mc' (ELBO)
      - KL weight beta_kl and annealing
-     - routing hyperparameters: top_k, temperature tau, capacity_factor
-     - optional warm-up: BASE-style / Bayesian-top-k style pretraining
+     - warm-up vs no warm-up (BASE-style / Bayesian-top-k style pretraining)
 2) Trains via the model's own train_one_epoch(...) (which already implements
    ELBO, KL annealing and optional aux balance losses).
 3) Optionally runs a warm-up phase via train_one_epoch_warmup(...) if the
@@ -25,23 +24,22 @@ What this script does
      - Several scatter/line plots:
           * Acc vs CV (balance vs performance)
           * Acc vs NMI_topk_soft (data-structure alignment vs performance)
-          * ECE vs beta_kl (per router_mode)
+          * ECE vs beta_kl (per router_mode + warmup)
           * Overflow vs capacity_factor
           * Img/s vs CV (efficiency vs balance)
-          * NMI_topk_soft vs beta_kl (per router_mode)
+          * NMI_topk_soft vs beta_kl (per router_mode + warmup)
 
 Design philosophy
 -----------------
-- The goal is NOT to force perfectly balanced expert loads, but to see how
-  different configurations trade off:
+- The goal is to isolate the effect of:
+    * introducing ELBO (router_mode='mc') vs expectation mode,
+    * and introducing warm-up (with different KL weights),
+  under fixed routing hyperparameters (top_k, tau, capacity, etc.).
+- We keep:
     * predictive performance (acc, NLL, ECE),
     * load balance (CV/Gini/overflow),
-    * and structural specialization (NMI_topk_soft) between experts and data.
-- ELBO-related knobs (router_mode='mc', beta_kl, etc.) and warm-up are treated
-  as levers to improve:
-    * training stability / efficiency,
-    * calibration,
-    * and the alignment between expert routing patterns and label structure.
+    * and structural specialization (NMI_topk_soft)
+  as the main axes for analysis.
 """
 
 import os
@@ -489,7 +487,7 @@ def default_base(output_size: int) -> Dict[str, Any]:
     Reasonable starting point for Bayesian_NN_Moe on CIFAR-10/100.
 
     This base config can be overridden by:
-      - CLI arguments (dataset, epochs, batch size, seeds, ...)
+      - CLI arguments (dataset, epochs, batch size, num_workers)
       - sweep_list() deltas (router_mode, beta_kl, warmup_epochs, etc.)
     """
     return dict(
@@ -498,7 +496,7 @@ def default_base(output_size: int) -> Dict[str, Any]:
         batch_size=64,
         num_workers=4,
         epochs=40,
-        seeds=[0],
+        seeds=[0],                     # single fixed seed
 
         # model / backbone sizes
         backbone="resnet18",
@@ -508,10 +506,10 @@ def default_base(output_size: int) -> Dict[str, Any]:
 
         # routing & Bayesian regularization
         top_k=2,
-        tau=1.2,                     # router temperature
-        capacity=1.0,                # capacity_factor
-        router_mode="expected",      # 'expected' or 'mc'
-        elbo_samples=2,              # used when router_mode=='mc'
+        tau=1.2,                       # router temperature
+        capacity=1.0,                  # capacity_factor
+        router_mode="expected",        # 'expected' or 'mc'
+        elbo_samples=2,                # used when router_mode=='mc'
         use_control_variate=True,
         prior_var=10.0,
         beta_kl=1e-6,
@@ -524,7 +522,7 @@ def default_base(output_size: int) -> Dict[str, Any]:
 
         # warm-up configuration
         use_warmup=False,
-        warmup_epochs=0,             # set >0 in sweeps to enable warm-up
+        warmup_epochs=0,
 
         # outputs
         output_size=output_size,
@@ -533,70 +531,83 @@ def default_base(output_size: int) -> Dict[str, Any]:
 
 def sweep_list() -> List[Dict[str, Any]]:
     """
-    Phase-I ablation sweep (compact but informative).
+    KL / ELBO ablation + warm-up ablation.
 
-    Each dict here specifies a delta from the base config. We intentionally
-    touch only a few key hyperparameters to answer:
+    Design:
+      - 5 KL weights: beta_kl in {0, 5e-7, 1e-6, 5e-6, 1e-5}
+      - 2 router modes: 'expected' vs 'mc'
+      - For each (mode, beta_kl):
+          * one run without warm-up
+          * one run with 10 epochs of warm-up
 
-      1) What is the impact of ELBO (router_mode='mc', beta_kl, etc.)?
-      2) How much does warm-up help (in terms of acc/efficiency/balance/NMI)?
-      3) How do routing hyperparameters (top_k, capacity, tau) affect balance
-         vs specialization?
-
-    You can expand/modify this list for more exhaustive experiments.
+    Total: 5 * 2 * 2 = 20 sweep configs.
     """
-    return [
-        # 0. Baseline: expected router, small KL, no warm-up
-        {"name": "baseline"},
 
-        # 1. MC-ELBO router, more samples, with control variate
-        {"name": "mc_elbo_cv",
-         "router_mode": "mc", "elbo_samples": 4, "use_control_variate": True},
+    betas = [0.0, 5e-7, 1e-6, 5e-6, 1e-5]
+    sweeps: List[Dict[str, Any]] = []
 
-        # 2. MC-ELBO router, no control variate (to see variance impact)
-        {"name": "mc_elbo_no_cv",
-         "router_mode": "mc", "elbo_samples": 4, "use_control_variate": False},
+    def beta_tag(beta: float) -> str:
+        """Nice string for beta in sweep names."""
+        if beta == 0.0:
+            return "0"
+        # e.g. 1e-06 -> "1e-6"
+        return f"{beta:.0e}".replace("+0", "").replace("+", "")
 
-        # 3. No KL (pure maximum likelihood on routing)
-        {"name": "no_kl", "beta_kl": 0.0},
+    # ---- (A) No warm-up: pure ELBO / KL effect ----
+    for beta in betas:
+        tag = beta_tag(beta)
 
-        # 4. Slightly stronger KL
-        {"name": "kl_stronger", "beta_kl": 1e-5},
+        # expected-mode router (deterministic logistic-normal expectation)
+        sweeps.append(
+            {
+                "name": f"expected_beta{tag}_nowarm",
+                "router_mode": "expected",
+                "beta_kl": beta,
+                "use_warmup": False,
+                "warmup_epochs": 0,
+            }
+        )
 
-        # 5. Lower temperature (sharper gate)
-        {"name": "tau_low", "tau": 0.7},
+        # mc-mode router (stochastic ELBO)
+        sweeps.append(
+            {
+                "name": f"mc_beta{tag}_nowarm",
+                "router_mode": "mc",
+                "elbo_samples": 4,
+                "use_control_variate": True,
+                "beta_kl": beta,
+                "use_warmup": False,
+                "warmup_epochs": 0,
+            }
+        )
 
-        # 6. Higher temperature (softer gate)
-        {"name": "tau_high", "tau": 2.0},
+    # ---- (B) With warm-up: same grid but with 10 warm-up epochs ----
+    for beta in betas:
+        tag = beta_tag(beta)
 
-        # 7. Top-1 routing (sparser selection)
-        {"name": "top1", "top_k": 1},
+        sweeps.append(
+            {
+                "name": f"expected_beta{tag}_warm10",
+                "router_mode": "expected",
+                "beta_kl": beta,
+                "use_warmup": True,
+                "warmup_epochs": 10,
+            }
+        )
 
-        # 8. Top-4 routing (denser selection)
-        {"name": "top4", "top_k": 4},
+        sweeps.append(
+            {
+                "name": f"mc_beta{tag}_warm10",
+                "router_mode": "mc",
+                "elbo_samples": 4,
+                "use_control_variate": True,
+                "beta_kl": beta,
+                "use_warmup": True,
+                "warmup_epochs": 10,
+            }
+        )
 
-        # 9. Low capacity (more overflow pressure)
-        {"name": "capacity_low", "capacity": 0.5},
-
-        # 10. High capacity (less overflow)
-        {"name": "capacity_high", "capacity": 2.0},
-
-        # 11. No weight decay (check its influence)
-        {"name": "no_wd", "weight_decay": 0.0},
-
-        # 12. Small aux balance losses (importance + load)
-        {"name": "aux_balance_small",
-         "w_importance": 0.01, "w_load": 0.01},
-
-        # 13. Warm-up only (expected router) before Bayesian training
-        {"name": "warmup_expected",
-         "use_warmup": True, "warmup_epochs": 10, "router_mode": "expected"},
-
-        # 14. Warm-up + MC-ELBO router
-        {"name": "warmup_mc_elbo",
-         "use_warmup": True, "warmup_epochs": 10,
-         "router_mode": "mc", "elbo_samples": 4, "use_control_variate": True},
-    ]
+    return sweeps
 
 
 # =========================================================
@@ -677,7 +688,7 @@ def run(args: argparse.Namespace):
     Steps:
       1) Build data loaders for CIFAR-10/100.
       2) Construct a base config, override with CLI args.
-      3) For each sweep delta and each random seed:
+      3) For each sweep delta and the single random seed:
             a) Build a model and optimizer.
             b) Optionally run warm-up (if use_warmup & model exposes warm-up).
             c) Train for cfg['epochs'] epochs via train_one_epoch(...).
@@ -728,7 +739,6 @@ def run(args: argparse.Namespace):
     base["batch_size"] = args.bs
     base["num_workers"] = args.workers
     base["epochs"] = args.epochs
-    base["seeds"] = [int(s) for s in args.seeds.split(",")]
     base["output_size"] = output_size
 
     sweeps = sweep_list()
@@ -894,6 +904,13 @@ def run(args: argparse.Namespace):
     df = pd.DataFrame(results)
     df.to_csv("ablation_results_raw.csv", index=False)
 
+    # Tag combinations of router mode and warm-up state for plotting
+    if "router_mode" in df.columns and "use_warmup" in df.columns:
+        df["mode_warmup"] = (
+            df["router_mode"].astype(str)
+            + np.where(df["use_warmup"], "+warm", "+nowarm")
+        )
+
     # Normalize img/s for scoring
     if df["img_s"].notna().any():
         mn, mx = df["img_s"].min(), df["img_s"].max()
@@ -950,13 +967,13 @@ def run(args: argparse.Namespace):
             ylabel="Accuracy",
         )
 
-    # (3) ECE vs beta_kl (grouped by router_mode)
-    if "beta_kl" in df.columns and "router_mode" in df.columns:
+    # (3) ECE vs beta_kl (one line per router_mode + warm-up state)
+    if "beta_kl" in df.columns and "mode_warmup" in df.columns:
         plot_line(
             df,
             x="beta_kl",
             y="ece",
-            group="router_mode",
+            group="mode_warmup",
             fname="plot_ece_vs_beta.png",
             xlabel="beta_kl (router KL weight)",
             ylabel="ECE",
@@ -985,13 +1002,13 @@ def run(args: argparse.Namespace):
             ylabel="Images/sec (throughput)",
         )
 
-    # (6) NMI_topk_soft vs beta_kl (grouped by router_mode)
-    if "nmi_topk_soft" in df.columns and "beta_kl" in df.columns:
+    # (6) NMI_topk_soft vs beta_kl (one line per router_mode + warm-up state)
+    if "nmi_topk_soft" in df.columns and "beta_kl" in df.columns and "mode_warmup" in df.columns:
         plot_line(
             df.dropna(subset=["nmi_topk_soft", "beta_kl"]),
             x="beta_kl",
             y="nmi_topk_soft",
-            group="router_mode",
+            group="mode_warmup",
             fname="plot_nmi_soft_vs_beta.png",
             xlabel="beta_kl (router KL weight)",
             ylabel="NMI_topk_soft",
@@ -1048,14 +1065,8 @@ if __name__ == "__main__":
         help="Number of main training epochs per sweep variant "
              "(warm-up epochs are configured inside sweep_list).",
     )
-    parser.add_argument(
-        "--seeds",
-        type=str,
-        default="0",
-        help="Comma-separated seeds, e.g. '0,1,2'.",
-    )
 
-    # ---------- New CLI arguments for GPU / sweep parallelism ----------
+    # ---------- CLI arguments for GPU / sweep parallelism ----------
     # num_gpus:
     #   - default is 1 if CUDA is available, otherwise 0.
     #   - interpreted as the total number of GPUs (i.e., concurrent processes)
