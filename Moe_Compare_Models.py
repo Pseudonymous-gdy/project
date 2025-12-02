@@ -104,7 +104,7 @@ DEFAULT_LR = 5e-4
 DEFAULT_WEIGHT_DECAY = 2e-2
 
 # main training epochs (warm-up epochs are extra)
-EPOCHS = 40
+EPOCHS = 200
 BATCH_SIZE = 64
 NUM_WORKERS = 2
 
@@ -112,7 +112,7 @@ NUM_WORKERS = 2
 RESULTS_CSV = "moe_compare_results.csv"
 
 # which ID datasets & models to run
-RUN_DATASETS = ["cifar10", "cifar100"]
+RUN_DATASETS = ["cifar100"]
 RUN_SPECS = [
     dict(model="bayes", router_mode="expected"),
     dict(model="bayes", router_mode="mc"),
